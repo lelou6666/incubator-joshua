@@ -1,5 +1,6 @@
 package joshua.decoder.phrase;
 
+import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -9,23 +10,37 @@ import java.util.List;
 import joshua.corpus.Vocabulary;
 import joshua.decoder.JoshuaConfiguration;
 import joshua.decoder.ff.FeatureFunction;
+<<<<<<< HEAD
 import joshua.decoder.ff.tm.BasicRuleCollection;
 import joshua.decoder.ff.tm.BilingualRule;
+=======
+>>>>>>> refs/remotes/apache/master
 import joshua.decoder.ff.tm.Grammar;
 import joshua.decoder.ff.tm.Rule;
 import joshua.decoder.ff.tm.RuleCollection;
 import joshua.decoder.ff.tm.Trie;
+<<<<<<< HEAD
 import joshua.util.io.LineReader;
+=======
+import joshua.decoder.ff.tm.hash_based.MemoryBasedBatchGrammar;
+import joshua.decoder.ff.tm.packed.PackedGrammar;
+>>>>>>> refs/remotes/apache/master
 
 /**
- * Represents a phrase table. Inherits from grammars so we can code-share with the syntax-
- * based decoding work.
+ * Represents a phrase table, and is implemented as a wrapper around either a {@link PackedGrammar}
+ * or a {@link MemoryBasedBatchGrammar}.
  * 
  * TODO: this should all be implemented as a two-level trie (source trie and target trie).
- *
  */
+<<<<<<< HEAD
 
 public class PhraseTable implements Grammar {
+=======
+public class PhraseTable implements Grammar {
+  
+  private JoshuaConfiguration config;
+  private Grammar backend;
+>>>>>>> refs/remotes/apache/master
   
   private String grammarFile;
   private int owner;
@@ -44,6 +59,7 @@ public class PhraseTable implements Grammar {
    * @param config
    * @throws IOException
    */
+<<<<<<< HEAD
   public PhraseTable(String grammarFile, String owner, JoshuaConfiguration config, List<FeatureFunction> features) throws IOException {
     this.config = config;
     this.owner = Vocabulary.id(owner);
@@ -105,13 +121,48 @@ public class PhraseTable implements Grammar {
     }
   }
 
+=======
+  public PhraseTable(String grammarFile, String owner, String type, JoshuaConfiguration config, int maxSource) 
+      throws IOException {
+    this.config = config;
+    int spanLimit = 0;
+    
+    if (grammarFile != null && new File(grammarFile).isDirectory()) {
+      this.backend = new PackedGrammar(grammarFile, spanLimit, owner, type, config);
+      if (this.backend.getMaxSourcePhraseLength() == -1) {
+        System.err.println("FATAL: Using a packed grammar for a phrase table backend requires that you");
+        System.err.println("       packed the grammar with Joshua 6.0.2 or greater");
+        System.exit(-1);
+      }
+
+    } else {
+      this.backend = new MemoryBasedBatchGrammar(type, grammarFile, owner, "[X]", spanLimit, config);
+    }
+  }
+  
+  public PhraseTable(String owner, JoshuaConfiguration config) {
+    this.config = config;
+    
+    this.backend = new MemoryBasedBatchGrammar(owner, config);
+  }
+      
+>>>>>>> refs/remotes/apache/master
   /**
-   * Returns the longest source phrase read, subtracting off the nonterminal that was added.
+   * Returns the longest source phrase read. For {@link MemoryBasedBatchGrammar}s, we subtract 1
+   * since the grammar includes the nonterminal. For {@link PackedGrammar}s, the value was either
+   * in the packed config file (Joshua 6.0.2+) or was passed in via the TM config line.
    * 
    * @return
    */
   public int getMaxSourcePhraseLength() {
+<<<<<<< HEAD
     return maxSourceLength;
+=======
+    if (backend instanceof MemoryBasedBatchGrammar)
+      return this.backend.getMaxSourcePhraseLength() - 1;
+    else
+      return this.backend.getMaxSourcePhraseLength();
+>>>>>>> refs/remotes/apache/master
   }
 
   /**
@@ -120,14 +171,38 @@ public class PhraseTable implements Grammar {
    * @param sourceWords the sequence of source words
    * @return the rules
    */
+<<<<<<< HEAD
   public List<Rule> getPhrases(int[] sourceWords) {
     RuleCollection rules = entries.get(new PhraseWrapper(sourceWords));
     if (rules != null) {
 //      System.err.println(String.format("PhraseTable::getPhrases(%s) = %d of them", Vocabulary.getWords(sourceWords),
 //          rules.getRules().size()));
       return rules.getSortedRules(features);
+=======
+  public RuleCollection getPhrases(int[] sourceWords) {
+    if (sourceWords.length != 0) {
+      Trie pointer = getTrieRoot();
+      if (! (backend instanceof PackedGrammar))
+        pointer = pointer.match(Vocabulary.id("[X]"));
+      int i = 0;
+      while (pointer != null && i < sourceWords.length)
+        pointer = pointer.match(sourceWords[i++]);
+
+      if (pointer != null && pointer.hasRules()) {
+        return pointer.getRuleCollection();
+      }
+>>>>>>> refs/remotes/apache/master
     }
     return null;
+  }
+
+  /**
+   * Adds a rule to the grammar. Only supported when the backend is a MemoryBasedBatchGrammar.
+   * 
+   * @param rule the rule to add
+   */
+  public void addRule(Rule rule) {
+    ((MemoryBasedBatchGrammar)backend).addRule(rule);
   }
   
   public void addEOSRule() {
@@ -148,6 +223,7 @@ public class PhraseTable implements Grammar {
   public void addOOVRules(int sourceWord, List<FeatureFunction> features) {
     // TODO: _OOV shouldn't be outright added, since the word might not be OOV for the LM (but now almost
     // certainly is)
+<<<<<<< HEAD
     int[] french = { Vocabulary.id("[X]"), sourceWord };
     
     String targetWord = (config.mark_oovs 
@@ -198,26 +274,80 @@ public class PhraseTable implements Grammar {
   @Override
   public boolean hasRuleForSpan(int startIndex, int endIndex, int pathLength) {
     // No limit on maximum phrase length
+=======
+    int targetWord = config.mark_oovs
+        ? Vocabulary.id(Vocabulary.word(sourceWord) + "_OOV")
+        : sourceWord;   
+
+    int nt_i = Vocabulary.id("[X]");
+    Rule oovRule = new Rule(nt_i, new int[] { nt_i, sourceWord },
+        new int[] { -1, targetWord }, "", 1, null);
+    addRule(oovRule);
+    oovRule.estimateRuleCost(featureFunctions);
+        
+//    String ruleString = String.format("[X] ||| [X,1] %s ||| [X,1] %s", 
+//        Vocabulary.word(sourceWord), Vocabulary.word(targetWord));
+//    BilingualRule oovRule = new HieroFormatReader().parseLine(ruleString);
+//    oovRule.setOwner(Vocabulary.id("oov"));
+//    addRule(oovRule);
+//    oovRule.estimateRuleCost(featureFunctions);
+  }
+
+  @Override
+  public Trie getTrieRoot() {
+    return backend.getTrieRoot();
+  }
+
+  @Override
+  public void sortGrammar(List<FeatureFunction> models) {
+    backend.sortGrammar(models);    
+  }
+
+  @Override
+  public boolean isSorted() {
+    return backend.isSorted();
+  }
+
+  /**
+   * This should never be called. 
+   */
+  @Override
+  public boolean hasRuleForSpan(int startIndex, int endIndex, int pathLength) {
+>>>>>>> refs/remotes/apache/master
     return true;
   }
 
   @Override
   public int getNumRules() {
+<<<<<<< HEAD
     return numRules;
+=======
+    return backend.getNumRules();
+>>>>>>> refs/remotes/apache/master
   }
 
   @Override
   public Rule constructManualRule(int lhs, int[] sourceWords, int[] targetWords, float[] scores,
+<<<<<<< HEAD
       int aritity) {
     return null;
+=======
+      int arity) {
+    return backend.constructManualRule(lhs,  sourceWords, targetWords, scores, arity);
+>>>>>>> refs/remotes/apache/master
   }
 
   @Override
   public void writeGrammarOnDisk(String file) {
+<<<<<<< HEAD
+=======
+    backend.writeGrammarOnDisk(file);
+>>>>>>> refs/remotes/apache/master
   }
 
   @Override
   public boolean isRegexpGrammar() {
+<<<<<<< HEAD
     return false;
   }
   
@@ -255,5 +385,18 @@ public class PhraseTable implements Grammar {
       }
       return false;
     }
+=======
+    return backend.isRegexpGrammar();
+  }
+
+  @Override
+  public int getOwner() {
+    return backend.getOwner();
+  }
+
+  @Override
+  public int getNumDenseFeatures() {
+    return backend.getNumDenseFeatures();
+>>>>>>> refs/remotes/apache/master
   }
 }

@@ -12,6 +12,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import joshua.corpus.Vocabulary;
+import joshua.decoder.segment_file.Token;
 import joshua.util.ChartSpan;
 
 /**
@@ -65,6 +66,11 @@ public class Lattice<Value> implements Iterable<Node<Value>> {
     this.latticeHasAmbiguity = isAmbiguous;
   }
 
+  /**
+   * Instantiates a lattice from a linear chain of values, i.e., a sentence.
+   * 
+   * @param linearChain a sequence of Value objects
+   */
   public Lattice(Value[] linearChain) {
     this.latticeHasAmbiguity = false;
     this.nodes = new ArrayList<Node<Value>>();
@@ -111,26 +117,24 @@ public class Lattice<Value> implements Iterable<Node<Value>> {
   }
 
   /**
-   * Convenience method to get a lattice from an int[].
-   * 
-   * This method is useful because Java's generics won't allow a primitive array to be passed as a
-   * generic array.
+   * Convenience method to get a lattice from a linear sequence of {@link Token} objects.
    * 
    * @param linearChain
    * @return Lattice representation of the linear chain.
    */
-  public static Lattice<Integer> createIntLattice(int[] linearChain) {
-    Integer[] integerSentence = new Integer[linearChain.length];
-    for (int i = 0; i < linearChain.length; i++) {
-      integerSentence[i] = linearChain[i];
+  public static Lattice<Token> createTokenLatticeFromString(String source) {
+    String[] tokens = source.split("\\s+");
+    Token[] integerSentence = new Token[tokens.length];
+    for (int i = 0; i < tokens.length; i++) {
+      integerSentence[i] = new Token(tokens[i]);
     }
 
-    return new Lattice<Integer>(integerSentence);
+    return new Lattice<Token>(integerSentence);
   }
 
-  public static Lattice<Integer> createIntLatticeFromString(String data) {
-    Map<Integer, Node<Integer>> nodes = new HashMap<Integer, Node<Integer>>();
-
+  public static Lattice<Token> createTokenLatticeFromPLF(String data) {
+    ArrayList<Node<Token>> nodes = new ArrayList<Node<Token>>();
+    
     // This matches a sequence of tuples, which describe arcs leaving this node
     Pattern nodePattern = Pattern.compile("(.+?)\\(\\s*(\\(.+?\\),\\s*)\\s*\\)(.*)");
 
@@ -146,8 +150,8 @@ public class Lattice<Value> implements Iterable<Node<Value>> {
     boolean latticeIsAmbiguous = false;
 
     int nodeID = 0;
-    Node<Integer> startNode = new Node<Integer>(nodeID);
-    nodes.put(nodeID, startNode);
+    Node<Token> startNode = new Node<Token>(nodeID);
+    nodes.add(startNode);
 
     while (nodeMatcher.matches()) {
 
@@ -156,15 +160,15 @@ public class Lattice<Value> implements Iterable<Node<Value>> {
 
       nodeID++;
 
-      Node<Integer> currentNode = null;
-      if (nodes.containsKey(nodeID)) {
+      Node<Token> currentNode = null;
+      if (nodeID < nodes.size() && nodes.get(nodeID) != null) {
         currentNode = nodes.get(nodeID);
       } else {
-        currentNode = new Node<Integer>(nodeID);
-        nodes.put(nodeID, currentNode);
+        currentNode = new Node<Token>(nodeID);
+        while (nodeID > nodes.size())
+          nodes.add(new Node<Token>(nodes.size()));
+        nodes.add(currentNode);
       }
-
-      logger.fine("Node " + nodeID + ":");
 
       Matcher arcMatcher = arcPattern.matcher(nodeData);
       int numArcs = 0;
@@ -177,19 +181,20 @@ public class Lattice<Value> implements Iterable<Node<Value>> {
         float arcWeight = Float.valueOf(arcMatcher.group(2));
         int destinationNodeID = nodeID + Integer.valueOf(arcMatcher.group(3));
 
-        Node<Integer> destinationNode;
-        if (nodes.containsKey(destinationNodeID)) {
+        Node<Token> destinationNode;
+        if (destinationNodeID < nodes.size() && nodes.get(destinationNodeID) != null) {
           destinationNode = nodes.get(destinationNodeID);
         } else {
-          destinationNode = new Node<Integer>(destinationNodeID);
-          nodes.put(destinationNodeID, destinationNode);
+          destinationNode = new Node<Token>(destinationNodeID);
+          while (destinationNodeID > nodes.size())
+            nodes.add(new Node<Token>(nodes.size()));
+          nodes.add(destinationNode);
         }
 
         String remainingArcs = arcMatcher.group(4);
 
-        logger.fine("\t" + arcLabel + " " + arcWeight + " " + destinationNodeID);
-        Integer intArcLabel = Vocabulary.id(arcLabel);
-        currentNode.addArc(destinationNode, arcWeight, intArcLabel);
+        Token arcToken = new Token(arcLabel);
+        currentNode.addArc(destinationNode, arcWeight, arcToken);
 
         arcMatcher = arcPattern.matcher(remainingArcs);
       }
@@ -200,26 +205,18 @@ public class Lattice<Value> implements Iterable<Node<Value>> {
     }
 
     /* Add <s> to the start of the lattice. */
-    if (nodes.containsKey(1)) {
-      Node<Integer> firstNode = nodes.get(1);
-      startNode.addArc(firstNode, 0.0f, Vocabulary.id(Vocabulary.START_SYM));
+    if (nodes.size() > 1 && nodes.get(1) != null) {
+      Node<Token> firstNode = nodes.get(1);
+      startNode.addArc(firstNode, 0.0f, new Token(Vocabulary.START_SYM));
     }
 
-    /* Add </s> as a final state, and connect it to all end-state nodes. */
-    Node<Integer> endNode = new Node<Integer>(++nodeID);
-    for (Node<Integer> node : nodes.values()) {
-      if (node.getOutgoingArcs().size() == 0)
-        node.addArc(endNode, 0.0f, Vocabulary.id(Vocabulary.STOP_SYM));
-    }
-    // Add the endnode after the above loop so as to avoid a self-loop.
-    nodes.put(nodeID, endNode);
+    /* Add </s> as a final state, connect it to the previous end-state */
+    nodeID = nodes.get(nodes.size()-1).getNumber() + 1;
+    Node<Token> endNode = new Node<Token>(nodeID);
+    nodes.get(nodes.size()-1).addArc(endNode, 0.0f, new Token(Vocabulary.STOP_SYM));
+    nodes.add(endNode);
 
-    List<Node<Integer>> nodeList = new ArrayList<Node<Integer>>(nodes.values());
-    Collections.sort(nodeList, new NodeIdentifierComparator());
-
-    logger.fine(nodeList.toString());
-
-    return new Lattice<Integer>(nodeList, latticeIsAmbiguous);
+    return new Lattice<Token>(nodes, latticeIsAmbiguous);
   }
 
   /**

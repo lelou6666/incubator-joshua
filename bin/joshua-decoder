@@ -16,7 +16,7 @@ E_OPTERROR=1
 mem=4g
 
 if [[ $1 == "-m" ]]; then
-	mem=$2
+    mem=$2
 
     shift
     shift
@@ -24,8 +24,10 @@ fi
 
 set -u
 
+JOSHUA=$(dirname $0)/..
+
 exec java -Xmx${mem} \
- 	-cp $JOSHUA/class:$JOSHUA/thrax/bin/thrax.jar:$JOSHUA/lib/berkeleylm.jar:$JOSHUA/lib/junit-4.10.jar \
+ 	-cp $JOSHUA/class:$JOSHUA/ext/berkeleylm/jar/berkeleylm.jar:$JOSHUA/lib/gson-2.5.jar \
 	-Dfile.encoding=utf8 \
 	-Djava.util.logging.config.file=${JOSHUA}/logging.properties \
 	-Djava.library.path=$JOSHUA/lib \

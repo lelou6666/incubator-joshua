@@ -43,6 +43,7 @@ public class TargetPhrases extends ArrayList<Rule> {
    * some trouble and should probably be reworked.
    */
   public void finish(List<FeatureFunction> features, FeatureVector weights, int num_options) {
+<<<<<<< HEAD
 //    for (Rule rule: this) { 
 //      if (rule.getPrecomputableCost() <= Float.NEGATIVE_INFINITY) {
 //        float score = rule.getFeatureVector().innerProduct(weights);
@@ -51,6 +52,12 @@ public class TargetPhrases extends ArrayList<Rule> {
 //      rule.estimateRuleCost(features);
 ////      System.err.println("TargetPhrases:finish(): " + rule);
 //    }
+=======
+    for (Rule rule: this) { 
+      rule.estimateRuleCost(features);
+//      System.err.println("TargetPhrases:finish(): " + rule);
+    }
+>>>>>>> refs/remotes/apache/master
     Collections.sort(this, Rule.EstimatedCostComparator);
     
     if (this.size() > num_options)
