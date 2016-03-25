@@ -1,5 +1,8 @@
 package joshua.decoder;
 
+import static joshua.util.FormatUtils.cleanNonTerminal;
+import static joshua.util.FormatUtils.markup;
+
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
@@ -160,6 +163,14 @@ public class JoshuaConfiguration {
   /* A list of weights found in the main config file (instead of in a separate weights file) */
   public ArrayList<String> weights = new ArrayList<String>();
 
+  /* Determines whether to expect JSON input or plain lines */
+  public enum INPUT_TYPE { plain, json };
+  public INPUT_TYPE input_type = INPUT_TYPE.plain;
+
+  /* Type of server. Not sure we need to keep the regular TCP one around. */
+  public enum SERVER_TYPE { none, TCP, HTTP };
+  public SERVER_TYPE server_type = SERVER_TYPE.TCP;
+  
   /* If set, Joshua will start a (multi-threaded, per "threads") TCP/IP server on this port. */
   public int server_port = 0;
 
@@ -438,11 +449,11 @@ public class JoshuaConfiguration {
             lattice_decoding = true;
 
           } else if (parameter.equals(normalize_key("default-non-terminal"))) {
-            default_non_terminal = String.format("[%s]", FormatUtils.cleanNonterminal(fds[1].trim()));
+            default_non_terminal = markup(cleanNonTerminal(fds[1].trim()));
             logger.finest(String.format("default_non_terminal: %s", default_non_terminal));
 
           } else if (parameter.equals(normalize_key("goal-symbol"))) {
-            goal_symbol = String.format("[%s]", FormatUtils.cleanNonterminal(fds[1].trim()));
+            goal_symbol = markup(cleanNonTerminal(fds[1].trim()));
             logger.finest("goalSymbol: " + goal_symbol);
 
           } else if (parameter.equals(normalize_key("weights-file"))) {
@@ -496,6 +507,25 @@ public class JoshuaConfiguration {
             pop_limit = Integer.valueOf(fds[1]);
             logger.finest(String.format("pop-limit: %s", pop_limit));
 
+          } else if (parameter.equals(normalize_key("input-type"))) {
+            if (fds[1].equals("json"))
+              input_type = INPUT_TYPE.json;
+            else if (fds[1].equals("plain"))
+              input_type = INPUT_TYPE.plain;
+            else {
+              System.err.println(String.format("* FATAL: invalid server type '%s'", fds[1]));
+              System.exit(1);
+            }
+            logger.info(String.format("    input-type: %s", input_type));
+
+          } else if (parameter.equals(normalize_key("server-type"))) {
+            if (fds[1].toLowerCase().equals("tcp"))
+              server_type = SERVER_TYPE.TCP;
+            else if (fds[1].toLowerCase().equals("http"))
+              server_type = SERVER_TYPE.HTTP;
+
+            logger.info(String.format("    server-type: %s", server_type));
+            
           } else if (parameter.equals(normalize_key("server-port"))) {
             server_port = Integer.parseInt(fds[1]);
             logger.info(String.format("    server-port: %d", server_port));
@@ -557,9 +587,6 @@ public class JoshuaConfiguration {
             
           } else if (parameter.equals(normalize_key("show-weights"))) {
             show_weights_and_quit = true;
-
-          } else if (parameter.equals(normalize_key("input-type"))) {
-            ; // for Moses compatibility; ignore this 
 
           } else if (parameter.equals(normalize_key("n-best-list"))) {
             // for Moses compatibility

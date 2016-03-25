@@ -2,13 +2,16 @@
 
 set -u
 
+export KENLM_MAX_ORDER=10
 export CXXFLAGS+=" -O3 -fPIC -DHAVE_ZLIB"
 export LDFLAGS+=" -lz"
 export CXX=${CXX:-g++}
 
-cd $JOSHUA/src/kenlm
-cmake -DCMAKE_CXX_FLAGS="$CXXFLAGS" .
-make
+cd $JOSHUA/ext/kenlm
+[[ ! -d build ]] && mkdir build
+cd build
+cmake .. -DKENLM_MAX_ORDER=$KENLM_MAX_ORDER -DCMAKE_BUILD_TYPE=Release
+make -j2
 cp bin/{query,lmplz,build_binary} $JOSHUA/bin
 
 if [ "$(uname)" == Darwin ]; then
@@ -19,4 +22,5 @@ else
   SUFFIX=so
 fi
 
-$CXX -std=gnu++11 -I. -DKENLM_MAX_ORDER=9 -I$JAVA_HOME/include -I$JOSHUA/src/kenlm -I$JAVA_HOME/include/linux -I$JAVA_HOME/include/darwin $JOSHUA/jni/kenlm_wrap.cc lm/CMakeFiles/kenlm.dir/*.o util/CMakeFiles/kenlm_util.dir/*.o util/CMakeFiles/kenlm_util.dir/double-conversion/*.o -shared -o $JOSHUA/lib/libken.$SUFFIX $CXXFLAGS $LDFLAGS $RT
+[[ ! -d "$JOSHUA/lib" ]] && mkdir "$JOSHUA/lib"
+$CXX -std=gnu++11 -I. -DKENLM_MAX_ORDER=$KENLM_MAX_ORDER -I$JAVA_HOME/include -I$JOSHUA/ext/kenlm -I$JAVA_HOME/include/linux -I$JAVA_HOME/include/darwin $JOSHUA/jni/kenlm_wrap.cc lm/CMakeFiles/kenlm.dir/*.o util/CMakeFiles/kenlm_util.dir/*.o util/CMakeFiles/kenlm_util.dir/double-conversion/*.o -shared -o $JOSHUA/lib/libken.$SUFFIX $CXXFLAGS $LDFLAGS $RT

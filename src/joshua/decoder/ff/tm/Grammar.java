@@ -64,6 +64,13 @@ public interface Grammar {
    * @return the number of rules stored in the grammar
    */
   int getNumRules();
+  
+  /**
+   * Returns the number of dense features.
+   * 
+   * @return the number of dense features
+   */
+  int getNumDenseFeatures();
 
   /**
    * This is used to construct a manual rule supported from outside the grammar, but the owner
@@ -105,4 +112,11 @@ public interface Grammar {
    * @param featureFunctions
    */
   void addOOVRules(int word, List<FeatureFunction> featureFunctions);
+  
+  /**
+   * Add a rule to the grammar.
+   *
+   * @param Rule the rule
+   */
+  void addRule(Rule rule);
 }

@@ -1,13 +1,21 @@
 package joshua.decoder;
 
+import java.io.BufferedReader;
 import java.io.FileInputStream;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.PrintStream;
+import java.net.InetSocketAddress;
 import java.util.logging.Logger;
 
-import joshua.decoder.io.TranslationRequest;
+import com.sun.net.httpserver.HttpServer;
+
+import joshua.decoder.JoshuaConfiguration.SERVER_TYPE;
+import joshua.decoder.io.TranslationRequestStream;
 import joshua.server.TcpServer;
+import joshua.server.ServerThread;
 
 /**
  * Implements decoder initialization, including interaction with <code>JoshuaConfiguration</code>
@@ -52,7 +60,20 @@ public class JoshuaDecoder {
     /* Step-2: Decoding */
     // create a server if requested, which will create TranslationRequest objects
     if (joshuaConfiguration.server_port > 0) {
-      new TcpServer(decoder, joshuaConfiguration.server_port,joshuaConfiguration).start();
+      int port = joshuaConfiguration.server_port;
+      if (joshuaConfiguration.server_type == SERVER_TYPE.TCP) {
+        new TcpServer(decoder, port, joshuaConfiguration).start();
+
+      } else if (joshuaConfiguration.server_type == SERVER_TYPE.HTTP) {
+        HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
+        Decoder.LOG(1, String.format("** HTTP Server running and listening on port %d.", port));  
+        server.createContext("/", new ServerThread(null, decoder, joshuaConfiguration));
+        server.setExecutor(null); // creates a default executor
+        server.start();
+      } else {
+        System.err.println("* FATAL: unknown server type");
+        System.exit(1);
+      }
       return;
     }
     
@@ -65,37 +86,10 @@ public class JoshuaDecoder {
     InputStream input = (joshuaConfiguration.input_file != null) 
       ? new FileInputStream(joshuaConfiguration.input_file)
       : System.in;
-    TranslationRequest fileRequest = new TranslationRequest(input, joshuaConfiguration);
-    Translations translationStream = decoder.decodeAll(fileRequest);
-    for (;;) {
-      Translation translation = translationStream.next();
-      if (translation == null)
-        break;
 
-      /**
-       * We need to munge the feature value outputs in order to be compatible with Moses tuners.
-       * Whereas Joshua writes to STDOUT whatever is specified in the `output-format` parameter,
-       * Moses expects the simple translation on STDOUT and the n-best list in a file with a fixed
-       * format.
-       */
-      String text;
-      if (joshuaConfiguration.moses) {
-        text = translation.toString().replaceAll("=", "= ");
-        // Write the complete formatted string to STDOUT
-        if (joshuaConfiguration.n_best_file != null)
-          out.write(text);
-        
-        // Extract just the translation and output that to STDOUT
-        text = text.substring(0,  text.indexOf('\n'));
-        String[] fields = text.split(" \\|\\|\\| ");
-        text = fields[1] + "\n";
-        
-      } else {
-        text = translation.toString();
-      }
-      
-      System.out.print(text);
-    }
+    BufferedReader reader = new BufferedReader(new InputStreamReader(input));
+    TranslationRequestStream fileRequest = new TranslationRequestStream(reader, joshuaConfiguration);
+    decoder.decodeAll(fileRequest, new PrintStream(System.out));
     
     if (joshuaConfiguration.n_best_file != null)
       out.close();
