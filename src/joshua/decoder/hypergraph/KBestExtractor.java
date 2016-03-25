@@ -4,6 +4,7 @@ import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.OutputStreamWriter;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -162,7 +163,11 @@ public class KBestExtractor {
           || joshuaConfiguration.outputFormat.contains("%d"))
         features = derivationState.replayFeatures();
 
-      hypothesis = derivationState.getHypothesis();
+      hypothesis = derivationState.getHypothesis()
+          .replaceAll("-lsb-", "[")
+          .replaceAll("-rsb-", "]")
+          .replaceAll("-pipe-", "|");
+
 
       outputString = joshuaConfiguration.outputFormat
           .replace("%k", Integer.toString(k))
@@ -422,7 +427,7 @@ public class KBestExtractor {
      */
     private void getCandidates(KBestExtractor kbestExtractor) {
       /* The list of candidates extending from this (virtual) node. */
-      candHeap = new PriorityQueue<DerivationState>();
+      candHeap = new PriorityQueue<DerivationState>(11, new DerivationStateComparator());
 
       /*
        * When exploring the cube frontier, there are multiple paths to each candidate. For example,
@@ -471,7 +476,7 @@ public class KBestExtractor {
       // TODO: if tem.size is too large, this may cause unnecessary computation, we comment the
       // segment to accommodate the unique nbest extraction
       /*
-       * if(tem.size()>global_n){ heap_cands=new PriorityQueue<DerivationState>(); for(int i=1;
+       * if(tem.size()>global_n){ heap_cands=new PriorityQueue<DerivationState>(new DerivationStateComparator()); for(int i=1;
        * i<=global_n; i++) heap_cands.add(tem.poll()); }else heap_cands=tem;
        */
     }
@@ -533,7 +538,7 @@ public class KBestExtractor {
    */
 
   // each DerivationState roughly corresponds to a hypothesis
-  public class DerivationState implements Comparable<DerivationState> {
+  public class DerivationState {
     /* The edge ("e" in the paper) */
     public HyperEdge edge;
 
@@ -622,7 +627,7 @@ public class KBestExtractor {
      * @return
      */
     public float getCost() {
-      return cost - weights.get("BLEU") * bleu;
+      return cost - weights.getSparse("BLEU") * bleu;
     }
 
     public String toString() {
@@ -687,7 +692,7 @@ public class KBestExtractor {
         if (edge.getTailNodes() != null) {
           int[] english = rule.getEnglish();
           for (int c = 0; c < english.length; c++) {
-            if (Vocabulary.idx(english[c])) {
+            if (Vocabulary.nt(english[c])) {
               int index = -(english[c] + 1);
               getChildDerivationState(edge, index).visit(visitor, indent + 1);
             }
@@ -737,17 +742,20 @@ public class KBestExtractor {
       return virtualChild.nbests.get(ranks[tailNodeIndex] - 1);
     }
 
+  } // end of Class DerivationState
+
+  public static class DerivationStateComparator implements Comparator<DerivationState> {
     // natural order by cost
-    public int compareTo(DerivationState another) {
-      if (this.getCost() > another.getCost()) {
+    public int compare(DerivationState one, DerivationState another) {
+      if (one.getCost() > another.getCost()) {
         return -1;
-      } else if (this.getCost() == another.getCost()) {
+      } else if (one.getCost() == another.getCost()) {
         return 0;
       } else {
         return 1;
       }
     }
-  } // end of Class DerivationState
+  }
 
   /**
    * This interface provides a generic way to do things at each stage of a derivation. The
@@ -877,7 +885,9 @@ public class KBestExtractor {
        */
       Tree fragment = Tree.getFragmentFromYield(rule.getEnglishWords());
       if (fragment == null) {
-        String subtree = String.format("(%s %s)", unbracketedLHS, quoteTerminals(rule.getEnglishWords()));
+        String subtree = String.format("(%s{%d-%d} %s)", unbracketedLHS, 
+            state.parentNode.i, state.parentNode.j, 
+            quoteTerminals(rule.getEnglishWords()));
         fragment = Tree.fromString(subtree);
       }
       
@@ -897,9 +907,9 @@ public class KBestExtractor {
         if (word.startsWith("[") && word.endsWith("]"))
           quotedWords += String.format("%s ", word);
         else
-          quotedWords += String.format(" \"%s\"", word);
+        quotedWords += String.format("\"%s\" ", word);
 
-      return quotedWords.substring(1);
+      return quotedWords.substring(0, quotedWords.length() - 1);
     }
 
     @Override

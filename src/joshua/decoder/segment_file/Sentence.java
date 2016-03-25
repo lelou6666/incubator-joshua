@@ -31,7 +31,7 @@ import joshua.util.Regex;
 public class Sentence {
 
   /* The sentence number. */
-  private int id = -1;
+  public int id = -1;
 
   /*
    * The source and target sides of the input sentence. Target sides are present when doing
@@ -46,6 +46,8 @@ public class Sentence {
 
   /* List of constraints */
   private final List<ConstraintSpan> constraints;
+  
+  private JoshuaConfiguration config = null;
 
   /**
    * Constructor. Receives a string representing the input sentence. This string may be a
@@ -57,6 +59,9 @@ public class Sentence {
   public Sentence(String inputString, int id, JoshuaConfiguration joshuaConfiguration) {
   
     inputString = Regex.spaces.replaceAll(inputString, " ").trim();
+    
+    config = joshuaConfiguration;
+    
     this.constraints = new LinkedList<ConstraintSpan>();
   
     // Check if the sentence has SGML markings denoting the
@@ -83,9 +88,14 @@ public class Sentence {
       }
       this.id = id;
     }
+    
+    // Mask strings that cause problems for the decoder
+    source = source.replaceAll("\\[",  "-lsb-")
+        .replaceAll("\\]",  "-rsb-")
+        .replaceAll("\\|",  "-pipe-");
   
-    // A maxlen of 0 means no limit. Only trim lattices that are linear chains.
-    if (joshuaConfiguration.maxlen != 0 && isLinearChain())
+    // Only trim strings
+    if (joshuaConfiguration.lattice_decoding && ! source.startsWith("((("))
       adjustForLength(joshuaConfiguration.maxlen);
   }
   
@@ -336,7 +346,7 @@ public class Sentence {
     assert isLinearChain();
     List<Token> tokens = new ArrayList<Token>();
     for (Node<Token> node: getLattice().getNodes())
-      if (node.getOutgoingArcs().size() > 0) 
+      if (node != null && node.getOutgoingArcs().size() > 0) 
         tokens.add(node.getOutgoingArcs().get(0).getLabel());
     return tokens;
   }
@@ -369,11 +379,17 @@ public class Sentence {
   }
 
   public Lattice<Token> getLattice() {
-    if (this.sourceLattice == null)
-      this.sourceLattice = (rawSource().startsWith("((("))
-        ? Lattice.createTokenLatticeFromPLF(rawSource())
-        : Lattice.createTokenLatticeFromString(String.format("%s %s %s", Vocabulary.START_SYM,
+    if (this.sourceLattice == null) {
+      if (config.lattice_decoding && rawSource().startsWith("(((")) {
+        if (config.search_algorithm.equals("stack")) {
+          System.err.println("* FATAL: lattice decoding currently not supported for stack-based search algorithm.");
+          System.exit(12);
+        }
+        this.sourceLattice = Lattice.createTokenLatticeFromPLF(rawSource());
+      } else
+        this.sourceLattice = Lattice.createTokenLatticeFromString(String.format("%s %s %s", Vocabulary.START_SYM,
             rawSource(), Vocabulary.STOP_SYM));
+    }
     return this.sourceLattice;
   }
 

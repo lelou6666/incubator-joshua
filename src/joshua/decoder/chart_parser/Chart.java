@@ -72,8 +72,7 @@ public class Chart {
   private int sourceLength;
   private List<FeatureFunction> featureFunctions;
   private Grammar[] grammars;
-  private DotChart[] dotcharts; // each grammar should have a dotchart
-                                // associated with it
+  private DotChart[] dotcharts; // each grammar should have a dotchart associated with it
   private Cell goalBin;
   private int goalSymbolID = -1;
   private Lattice<Token> inputLattice;
@@ -134,7 +133,6 @@ public class Chart {
     this.dotcharts = new DotChart[this.grammars.length];
     for (int i = 0; i < this.grammars.length; i++)
       this.dotcharts[i] = new DotChart(this.inputLattice, this.grammars[i], this,
-          NonterminalMatcher.createNonterminalMatcher(config2),
           this.grammars[i].isRegexpGrammar());
 
     // Begin to do initialization work

@@ -30,6 +30,15 @@ public class Translation {
    */
   private String output = null;
 
+  /**
+   * The raw one-best translation.
+   */
+  private String rawTranslation = null;
+  
+  public String rawTranslation() {
+    return rawTranslation;
+  }
+
   public Translation(Sentence source, HyperGraph hypergraph, 
       List<FeatureFunction> featureFunctions, JoshuaConfiguration joshuaConfiguration) {
     this.source = source;
@@ -47,13 +56,13 @@ public class Translation {
 
         // We must put this weight as zero, otherwise we get an error when we try to retrieve it
         // without checking
-        Decoder.weights.put("BLEU", 0);
+        Decoder.weights.increment("BLEU", 0);
 
-        String best = ViterbiExtractor.extractViterbiString(hypergraph.goalNode).trim();
-        best = best.substring(best.indexOf(' ') + 1, best.lastIndexOf(' '));
+        rawTranslation = ViterbiExtractor.extractViterbiString(hypergraph.goalNode).trim();
+        rawTranslation = rawTranslation.substring(new String("<s>").length() + 1, rawTranslation.lastIndexOf("</s>"));
         
         Decoder.LOG(1, String.format("Translation %d: %.3f %s", source.id(), hypergraph.goalNode.getScore(),
-            best));
+            rawTranslation));
         
         if (joshuaConfiguration.topN == 0) {
           
@@ -62,8 +71,8 @@ public class Translation {
            * the output-string, with the understanding that we can only substitute variables for the
            * output string, sentence number, and model score.
            */
-          String translation = joshuaConfiguration.outputFormat.replace("%s", best)
-              .replace("%S", DeNormalize.processSingleLine(best))
+          String translation = joshuaConfiguration.outputFormat.replace("%s", rawTranslation)
+              .replace("%S", DeNormalize.processSingleLine(rawTranslation))
               .replace("%c", String.format("%.3f", hypergraph.goalNode.getScore()))
               .replace("%i", String.format("%d", source.id()));
 
@@ -74,10 +83,10 @@ public class Translation {
           kBestExtractor.lazyKBestExtractOnHG(hypergraph, joshuaConfiguration.topN, out);
 
           if (joshuaConfiguration.rescoreForest) {
-            Decoder.weights.put("BLEU", joshuaConfiguration.rescoreForestWeight);
+            Decoder.weights.increment("BLEU", joshuaConfiguration.rescoreForestWeight);
             kBestExtractor.lazyKBestExtractOnHG(hypergraph, joshuaConfiguration.topN, out);
 
-            Decoder.weights.put("BLEU", -joshuaConfiguration.rescoreForestWeight);
+            Decoder.weights.increment("BLEU", -joshuaConfiguration.rescoreForestWeight);
             kBestExtractor.lazyKBestExtractOnHG(hypergraph, joshuaConfiguration.topN, out);
           }
         }
@@ -88,26 +97,20 @@ public class Translation {
 
       } else {
         
-        if (source.isEmpty()) {
-          // Empty output just gets echoed back
-          out.write("");
-          out.newLine();
-        } else {
-          // Failed translations get empty formatted outputs
-          // @formatter:off
-          String outputString = joshuaConfiguration.outputFormat
-              .replace("%s", source.source())
-              .replace("%e", "")
-              .replace("%S", "")
-              .replace("%t", "()")
-              .replace("%i", Integer.toString(source.id()))
-              .replace("%f", "")
-              .replace("%c", "0.000");
-          // @formatter:on
+        // Failed translations and blank lines get empty formatted outputs
+        // @formatter:off
+        String outputString = joshuaConfiguration.outputFormat
+            .replace("%s", source.source())
+            .replace("%e", "")
+            .replace("%S", "")
+            .replace("%t", "()")
+            .replace("%i", Integer.toString(source.id()))
+            .replace("%f", "")
+            .replace("%c", "0.000");
+        // @formatter:on
 
-          out.write(outputString);
-          out.newLine();
-        }
+        out.write(outputString);
+        out.newLine();
       }
 
       out.flush();

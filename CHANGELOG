@@ -1,3 +1,54 @@
+6.0.5 (October 23, 2015)
+========================
+
+- KenLM updated, includes vastly improved cmake-based build
+- Fix for grammar packing that previously limited the size of grammars (esp. Hiero)
+- Support for packing and decoding with multiple packed grammars (if packed together)
+- Feature functions now report dense features, for more efficient handling
+- Added AdaGrad and internal MIRA
+- Pipeline:
+  - Alignment of different chunks now parallelized
+  - Computes meteor scores if $METEOR is defined
+  - Updated to use Hadoop 2.5.2
+  - Reworked how multiple tuning runs (for optimizer instability) function 
+- Maven compatibility
+- Developers
+  - Ant eclipse target
+  - Added code formatting spec for Eclipse import
+- Many bugfixes and other improvements
+
+6.0.4 (June 15, 2015)
+=====================
+
+- Local MIRA implementation (now the default for the pipeline; Moses' kbmira available
+  with '--tuner kbmira')
+- PRO tuning implementation restored
+- Alignment in pipeline parallelized across chunks (up to --threads)
+- Better integration for class-based LMs
+- Bugfixes in pipeline script and elsewhere
+- Logic for KenLM/lmplz boost compile improved
+
+6.0.3 (June 1, 2015)
+====================
+
+- New, more versatile run bundler for creating language packs
+- Restructuring of the pipeline. Now uses the run bundler to build models
+  for tuning and testing, and no longer directly supports multiple optimizer
+  runs
+- Split out ZMERT / PRO tuning script into run_zmert.py, to facilitate 
+  running ZMERT independently
+- Fix to ivy (dependency download tool) for offline and cached downloads
+- Other bug fixes and changes
+
+6.0.2 (April 10, 2015)
+======================
+
+- Restored compatibility with Moses 3.0 tuning regime (tuning with kbmira 
+  now requires Moses 3.0)
+- Sparse feature support in grammar file, which enables compatibility with 
+  PPDB grammars (paraphrase.org)
+- Bugfixes and other minor improvements
+
 6.0.1 (March 6, 2015)
 =====================
 

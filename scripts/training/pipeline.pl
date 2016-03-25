@@ -1,4 +1,4 @@
-#!/usr/bin/perl
+#!/usr/bin/env perl
 
 # This script implements the Joshua pipeline.  It can run a complete
 # pipeline --- from raw training corpora to bleu scores on a test set
@@ -28,8 +28,11 @@ use File::Basename;
 use Cwd qw[abs_path getcwd];
 use POSIX qw[ceil];
 use List::Util qw[max min sum];
-use File::Temp qw[:mktemp];
+use File::Temp qw[:mktemp tempdir];
 use CachePipe;
+
+# There are some Perl 5.10 Unicode bugs that cause problems, mostly in sub-scripts
+use v5.12;
 # use Thread::Pool;
 
 # Hadoop uses a stupid hacker trick to change directories, but (per Lane Schwartz) if CDPATH
@@ -39,14 +42,14 @@ delete $ENV{CDPATH};
 
 my $HADOOP = $ENV{HADOOP};
 my $MOSES = $ENV{MOSES};
-delete $ENV{GREP_OPTIONS};
-
+my $METEOR = $ENV{METEOR};
 my $THRAX = "$JOSHUA/thrax";
+delete $ENV{GREP_OPTIONS};
 
 die not_defined("JAVA_HOME") unless exists $ENV{JAVA_HOME};
 
-my (@CORPORA,$TUNE,$TEST,$ALIGNMENT,$SOURCE,$TARGET,@LMFILES,$GRAMMAR_FILE,$GLUE_GRAMMAR_FILE,$TUNE_GRAMMAR_FILE,$TEST_GRAMMAR_FILE,$THRAX_CONF_FILE);
-my $FIRST_STEP = "FIRST";
+my (@CORPORA,$TUNE,$TEST,$ALIGNMENT,$SOURCE,$TARGET,@LMFILES,$GRAMMAR_FILE,$GLUE_GRAMMAR_FILE,$_TUNE_GRAMMAR_FILE,$_TEST_GRAMMAR_FILE,$THRAX_CONF_FILE, $_JOSHUA_CONFIG, $_JOSHUA_ARGS);
+my $FIRST_STEP = "SUBSAMPLE";
 my $LAST_STEP  = "LAST";
 my $LMFILTER = "$ENV{HOME}/code/filter/filter";
 
@@ -60,20 +63,25 @@ my $MAXSPAN = 20;
 my $MAXLEN_TUNE = 0;
 my $MAXLEN_TEST = 0;
 
+# when doing phrase-based decoding, the maximum length of a phrase (source side)
+my $MAX_PHRASE_LEN = 5;
+
 my $DO_FILTER_TM = 1;
 my $DO_SUBSAMPLE = 0;
 my $DO_PACK_GRAMMARS = 1;
 my $SCRIPTDIR = "$JOSHUA/scripts";
-my $TOKENIZER_SOURCE = "$SCRIPTDIR/training/penn-treebank-tokenizer.perl";
-my $TOKENIZER_TARGET = "$SCRIPTDIR/training/penn-treebank-tokenizer.perl";
-my $NORMALIZER = "$SCRIPTDIR/training/normalize-punctuation.pl";
+my $TOKENIZER_SOURCE = "$SCRIPTDIR/preparation/tokenize.pl";
+my $TOKENIZER_TARGET = "$SCRIPTDIR/preparation/detokenize.pl";
+my $NORMALIZER = "$SCRIPTDIR/preparation/normalize.pl";
+my $LOWERCASER = "$SCRIPTDIR/preparation/lowercase.pl";
 my $GIZA_TRAINER = "$SCRIPTDIR/training/run-giza.pl";
 my $TUNECONFDIR = "$SCRIPTDIR/training/templates/tune";
 my $SRILM = ($ENV{SRILM}||"")."/bin/i686-m64/ngram-count";
 my $COPY_CONFIG = "$SCRIPTDIR/copy-config.pl";
+my $BUNDLER = "$JOSHUA/scripts/support/run_bundler.py";
 my $STARTDIR;
 my $RUNDIR = $STARTDIR = getcwd();
-my $GRAMMAR_TYPE = "hiero";  # or "itg" or "samt" or "ghkm" or "phrase"
+my $GRAMMAR_TYPE = undef; # hiero, itg, samt, ghkm, phrase, or moses
 my $SEARCH_ALGORITHM = "cky"; # or "stack" (for phrase-based)
 
 # Which GHKM extractor to use ("galley" or "moses")
@@ -82,33 +90,24 @@ my $EXTRACT_OPTIONS = "";
 
 my $WITTEN_BELL = 0;
 
-my $JOSHUA_ARGS = "";
-
 # Run description.
 my $README = undef;
 
 # gzip-aware cat
 my $CAT = "$SCRIPTDIR/training/scat";
 
+# custom version of paste that dies on unequal file lengths
+my $PASTE = "$SCRIPTDIR/training/paste";
+
 # where processed data files are stored
 my $DATA_DIR = "data";
-
-# this file should exist in the Joshua mert templates file; it contains
-# the Joshua command invoked by MERT
-my $JOSHUA_CONFIG_ORIG   = "$TUNECONFDIR/joshua.config";
-my %TUNEFILES = (
-  'decoder_command' => "$TUNECONFDIR/decoder_command.qsub",
-  'joshua.config'   => $JOSHUA_CONFIG_ORIG,
-  'mert.config'     => "$TUNECONFDIR/mert.config",
-  'pro.config'      => "$TUNECONFDIR/pro.config",
-  'params.txt'      => "$TUNECONFDIR/params.txt",
-);
 
 # Whether to do MBR decoding on the n-best list (for test data).
 my $DO_MBR = 0;
 
 # Which aligner to use. The options are "giza" or "berkeley".
 my $ALIGNER = "giza"; # "berkeley" or "giza" or "jacana"
+my $ALIGNER_CONF = "$JOSHUA/scripts/training/templates/alignment/word-align.conf";
 
 # Filter rules to the following maximum scope (Hopkins & Langmead, 2011).
 my $SCOPE = 3;
@@ -119,11 +118,11 @@ my $FILTERING = "fast";
 # This is the amount of memory made available to Joshua.  You'll need
 # a lot more than this for SAMT decoding (though really it depends
 # mostly on your grammar size)
-my $JOSHUA_MEM = "3100m";
+my $JOSHUA_MEM = "4g";
 
 # the amount of memory available for hadoop processes (passed to
 # Hadoop via -Dmapred.child.java.opts
-my $HADOOP_MEM = "2g";
+my $HADOOP_MEM = "4g";
 
 # The location of a custom core-site.xml file, if desired (optional).
 my $HADOOP_CONF = undef;
@@ -175,22 +174,20 @@ my $DO_BUILD_LM_FROM_CORPUS = 1;
 my $DO_BUILD_CLASS_LM = 0;
 my $CLASS_LM_CORPUS = undef;
 my $CLASS_MAP = undef;
-my $CLASS_LM_ORDER = 9;
+my $CLASS_LM_ORDER = 5;
 
 # whether to tokenize and lowercase training, tuning, and test data
 my $DO_PREPARE_CORPORA = 1;
 
-# how many optimizer runs to perform
-my $OPTIMIZER_RUNS = 1;
+# compute the nth optimizer run
+my $OPTIMIZER_RUN = 1;
 
 # what to use to create language models ("berkeleylm" or "srilm")
 my $LM_GEN = "kenlm";
 my $LM_OPTIONS = "";
 
-my @STEPS = qw[FIRST SUBSAMPLE ALIGN PARSE THRAX GRAMMAR PHRASE TUNE MERT PRO TEST LAST];
+my @STEPS = qw[FIRST SUBSAMPLE ALIGN PARSE THRAX MODEL GRAMMAR PHRASE TUNE MERT PRO TEST LAST];
 my %STEPS = map { $STEPS[$_] => $_ + 1 } (0..$#STEPS);
-
-my $NAME = undef;
 
 # Methods to use for merging alignments (see Koehn et al., 2003).
 # Options are union, {intersect, grow, srctotgt, tgttosrc}-{diag,final,final-and,diag-final,diag-final-and}
@@ -200,10 +197,14 @@ my $GIZA_MERGE = "grow-diag-final";
 my $MERGE_LMS = 0;
 
 # Which tuner to use by default
-my $TUNER = "mert";  # or "pro" or "mira"
+my @TUNERS = ("mert", "pro", "mira", "adagrad", "kbmira");
+my $TUNER = "mert";
 
-# The number of iterations of the mira to run
-my $MIRA_ITERATIONS = 15;
+# The metric to update to
+my $METRIC = "BLEU 4 closest";
+
+# The number of iterations of the tuner to run
+my $TUNER_ITERATIONS = 10;
 
 # location of already-parsed corpus
 my $PARSED_CORPUS = undef;
@@ -229,10 +230,10 @@ my $retval = GetOptions(
   "tune=s"          => \$TUNE,
   "test=s"            => \$TEST,
   "prepare!"          => \$DO_PREPARE_CORPORA,
-  "name=s"            => \$NAME,
   "aligner=s"         => \$ALIGNER,
   "alignment=s"      => \$ALIGNMENT,
   "aligner-mem=s"     => \$ALIGNER_MEM,
+  "aligner-conf=s"   => \$ALIGNER_CONF,
   "giza-merge=s"      => \$GIZA_MERGE,
   "source=s"          => \$SOURCE,
   "target=s"         => \$TARGET,
@@ -248,10 +249,10 @@ my $retval = GetOptions(
   "lm-order=i"        => \$LM_ORDER,
   "corpus-lm!"        => \$DO_BUILD_LM_FROM_CORPUS,
   "witten-bell!"     => \$WITTEN_BELL,
-  "tune-grammar=s"    => \$TUNE_GRAMMAR_FILE,
-  "test-grammar=s"    => \$TEST_GRAMMAR_FILE,
+  "tune-grammar=s"    => \$_TUNE_GRAMMAR_FILE,
+  "test-grammar=s"    => \$_TEST_GRAMMAR_FILE,
   "grammar=s"        => \$GRAMMAR_FILE,
-  "glue-grammar=s"     => \$GLUE_GRAMMAR_FILE,
+  "model=s"          => \$GRAMMAR_FILE,
   "maxspan=i"         => \$MAXSPAN,
   "mbr!"              => \$DO_MBR,
   "type=s"           => \$GRAMMAR_TYPE,
@@ -262,20 +263,19 @@ my $retval = GetOptions(
   "maxlen-test=i"        => \$MAXLEN_TEST,
   "tokenizer-source=s"      => \$TOKENIZER_SOURCE,
   "tokenizer-target=s"      => \$TOKENIZER_TARGET,
-  "joshua-config=s"   => \$TUNEFILES{'joshua.config'},
-  "pro-config=s"   => \$TUNEFILES{'pro.config'},
-  "params-txt=s"   => \$TUNEFILES{'params.txt'},
-  "joshua-args=s"      => \$JOSHUA_ARGS,
+  "normalizer=s"      => \$NORMALIZER,
+  "joshua-config=s"   => \$_JOSHUA_CONFIG,
+  "joshua-args=s"      => \$_JOSHUA_ARGS,
   "joshua-mem=s"      => \$JOSHUA_MEM,
   "hadoop-mem=s"      => \$HADOOP_MEM,
   "parser-mem=s"      => \$PARSER_MEM,
   "buildlm-mem=s"     => \$BUILDLM_MEM,
   "packer-mem=s"      => \$PACKER_MEM,
   "pack!"             => \$DO_PACK_GRAMMARS,
-  "decoder-command=s" => \$TUNEFILES{'decoder_command'},
   "tuner=s"           => \$TUNER,
   "tuner-mem=s"       => \$TUNER_MEM,
-  "mira-iterations=i" => \$MIRA_ITERATIONS,
+  "tuner-iterations=i" => \$TUNER_ITERATIONS,
+  "tuner-metric=s"    => \$METRIC,
   "thrax=s"           => \$THRAX,
   "thrax-conf=s"      => \$THRAX_CONF_FILE,
   "jobs=i"            => \$NUM_JOBS,
@@ -288,7 +288,6 @@ my $retval = GetOptions(
   "aligner-chunk-size=s" => \$ALIGNER_BLOCKSIZE,
   "hadoop=s"          => \$HADOOP,
   "hadoop-conf=s"          => \$HADOOP_CONF,
-  "optimizer-runs=i"  => \$OPTIMIZER_RUNS,
   "tmp=s"             => \$TMPDIR,
   "nbest=i"           => \$NBEST,
   "reordering-limit=i" => \$REORDERING_LIMIT,
@@ -296,7 +295,8 @@ my $retval = GetOptions(
   "ner-tagger=s"   => \$NER_TAGGER,
   "class-lm!"     => \$DO_BUILD_CLASS_LM,
   "class-lm-corpus=s"   => \$CLASS_LM_CORPUS,
-  "class-map"     => \$CLASS_MAP,
+  "class-map=s"     => \$CLASS_MAP,
+  "optimizer-run=i" => \$OPTIMIZER_RUN,
 );
 
 if (! $retval) {
@@ -310,15 +310,7 @@ $TUNER = lc $TUNER;
 
 my $DOING_LATTICES = 0;
 
-# Prepend a space to the arguments list if it's non-empty and doesn't already have the space.
-if ($JOSHUA_ARGS ne "" and $JOSHUA_ARGS !~ /^\s/) {
-  $JOSHUA_ARGS = " $JOSHUA_ARGS";
-}
-
-$TUNEFILES{'joshua.config'} = get_absolute_path($TUNEFILES{'joshua.config'});
-$TUNEFILES{'pro.config'} = get_absolute_path($TUNEFILES{'pro.config'});
-$TUNEFILES{'params.txt'} = get_absolute_path($TUNEFILES{'params.txt'});
-$TUNEFILES{'decoder_command'} = get_absolute_path($TUNEFILES{'decoder_command'});
+my $JOSHUA_ARGS = (defined $_JOSHUA_ARGS) ? $_JOSHUA_ARGS : "";
 
 my %DATA_DIRS = (
   train => get_absolute_path("$RUNDIR/$DATA_DIR/train"),
@@ -326,8 +318,9 @@ my %DATA_DIRS = (
   test  => get_absolute_path("$RUNDIR/$DATA_DIR/test"),
 );
 
-if (defined $NAME) {
-  map { $DATA_DIRS{$_} .= "/$NAME" } (keys %DATA_DIRS);
+if (! -x $NORMALIZER) {
+  print "* FATAL: couldn't find normalizer '$NORMALIZER'\n";
+  exit 1;
 }
 
 # capitalize these to offset a common error:
@@ -391,10 +384,16 @@ foreach my $lmfile (@LMFILES) {
   }
 }
 
+my @GRAMMAR_TYPES = qw/hiero samt ghkm phrase moses/;
+if (! defined $GRAMMAR_TYPE or ! in($GRAMMAR_TYPE,\@GRAMMAR_TYPES)) {
+  print "* FATAL: You must define --type (" . join("|", @GRAMMAR_TYPES) . ")\n";
+  exit 47;
+}
+
 # case-normalize this
 $GRAMMAR_TYPE = lc $GRAMMAR_TYPE;
 
-if ($GRAMMAR_TYPE eq "phrase") {
+if ($GRAMMAR_TYPE eq "phrase" or $GRAMMAR_TYPE eq "moses") {
   $SEARCH_ALGORITHM = "stack";
   $MAXSPAN = 0;
 }
@@ -429,18 +428,25 @@ if (! defined $TEST and ($STEPS{$FIRST_STEP} <= $STEPS{TEST}
   exit 1;
 }
 
-# make sure a grammar file was given if we're skipping training
-if (! defined $GRAMMAR_FILE) {
-  if ($STEPS{$FIRST_STEP} >= $STEPS{TEST}) {
-    if (! defined $TEST_GRAMMAR_FILE) {
-      print "* FATAL: need a grammar (--grammar or --test-grammar) if you're skipping to testing\n";
-			exit 1;
-		}
-  } elsif ($STEPS{$FIRST_STEP} >= $STEPS{TUNE}) {
-		if (! defined $TUNE_GRAMMAR_FILE) {
-			print "* FATAL: need a grammar (--grammar or --tune-grammar) if you're skipping grammar learning\n";
-			exit 1;
-		}
+# Joshua config
+my $JOSHUA_CONFIG = get_absolute_path($_JOSHUA_CONFIG || "$TUNECONFDIR/joshua.config", $STARTDIR);
+
+# make sure we have a tuned config file if we're skipping model building and tuning
+if ($STEPS{$FIRST_STEP} >= $STEPS{TEST}) {
+  if (! defined $JOSHUA_CONFIG) {
+    print "* FATAL: You need to provide a tuned Joshua config file (--joshua-config)\n";
+    print "         if you're skipping straight to testing\n";
+    exit 1;
+  }
+}
+
+# make sure we have either a config file or a grammar and LM if we're skipping model building
+if ($STEPS{$FIRST_STEP} >= $STEPS{TUNE}) {
+  if (! defined $JOSHUA_CONFIG and ((! defined $_TUNE_GRAMMAR_FILE and ! defined $GRAMMAR_FILE) or scalar(@LMFILES) == 0)) {
+    print "* FATAL: You must provide either a Joshua config file (--joshua-config) or\n";
+    print "         a grammar (--grammar or --tune-grammar) and at least one LM (--lmfile)\n";
+    print "         if you're skipping straight to tuning\n";
+    exit 1;
   }
 }
 
@@ -450,16 +456,20 @@ if ($LM_GEN eq "srilm" && (scalar @LMFILES == 0) && $STEPS{$FIRST_STEP} <= $STEP
 }
 
 # check for file presence
+if (defined $JOSHUA_CONFIG and ! -e $JOSHUA_CONFIG) {
+  print "* FATAL: couldn't find joshua config file '$JOSHUA_CONFIG'\n";
+  exit 1;
+}
 if (defined $GRAMMAR_FILE and ! -e $GRAMMAR_FILE) {
   print "* FATAL: couldn't find grammar file '$GRAMMAR_FILE'\n";
   exit 1;
 }
-if (defined $TUNE_GRAMMAR_FILE and ! -e $TUNE_GRAMMAR_FILE) {
-  print "* FATAL: couldn't find tuning grammar file '$TUNE_GRAMMAR_FILE'\n";
+if (defined $_TUNE_GRAMMAR_FILE and ! -e $_TUNE_GRAMMAR_FILE) {
+  print "* FATAL: couldn't find tuning grammar file '$_TUNE_GRAMMAR_FILE'\n";
   exit 1;
 }
-if (defined $TEST_GRAMMAR_FILE and ! -e $TEST_GRAMMAR_FILE) {
-  print "* FATAL: couldn't find test grammar file '$TEST_GRAMMAR_FILE'\n";
+if (defined $_TEST_GRAMMAR_FILE and ! -e $_TEST_GRAMMAR_FILE) {
+  print "* FATAL: couldn't find test grammar file '$_TEST_GRAMMAR_FILE'\n";
   exit 1;
 }
 if (defined $ALIGNMENT and ! -e $ALIGNMENT) {
@@ -480,8 +490,8 @@ $TEST = get_absolute_path($TEST);
 
 $GRAMMAR_FILE = get_absolute_path($GRAMMAR_FILE);
 $GLUE_GRAMMAR_FILE = get_absolute_path($GLUE_GRAMMAR_FILE);
-$TUNE_GRAMMAR_FILE = get_absolute_path($TUNE_GRAMMAR_FILE);
-$TEST_GRAMMAR_FILE = get_absolute_path($TEST_GRAMMAR_FILE);
+$_TUNE_GRAMMAR_FILE = get_absolute_path($_TUNE_GRAMMAR_FILE);
+$_TEST_GRAMMAR_FILE = get_absolute_path($_TEST_GRAMMAR_FILE);
 $THRAX_CONF_FILE = get_absolute_path($THRAX_CONF_FILE);
 $ALIGNMENT = get_absolute_path($ALIGNMENT);
 $HADOOP_CONF = get_absolute_path($HADOOP_CONF);
@@ -514,15 +524,18 @@ if ($LM_GEN ne "berkeleylm" and $LM_GEN ne "srilm" and $LM_GEN ne "kenlm") {
   exit 1;
 }
 
-if ($TUNER eq "mira") {
-  if (! defined $MOSES) {
-    print "* FATAL: using MIRA for tuning requires setting the MOSES environment variable\n";
-    exit 1;
-  }
+if ($TUNER eq "kbmira" and ! defined $MOSES) {
+  print "* FATAL: using 'kbmira' for tuning requires setting the MOSES environment variable\n";
+  exit 1;
 }
 
-if ($TUNER ne "mert" and $TUNER ne "mira" and $TUNER ne "pro") {
-  print "* FATAL: --tuner must be one of 'mert', 'pro', or 'mira'.\n";
+if ($GRAMMAR_TYPE eq "moses" and ! defined $MOSES) {
+  print "* FATAL: building Moses phrase-based models (--type moses) requires setting the MOSES environment variable\n";
+  exit 1;
+}
+
+if (! in($TUNER, \@TUNERS)) {
+  print "* FATAL: --tuner must be one of " . join(", ", @TUNERS) . $/;
   exit 1;
 }
 
@@ -549,13 +562,7 @@ if (defined $HADOOP_CONF && ! -e $HADOOP_CONF) {
 ## Dependent variable setting ######################################################################
 ####################################################################################################
 
-# if parallelization is turned off, then use the sequential version of
-# the decoder command
-if ($NUM_JOBS == 1) {
-  $TUNEFILES{'decoder_command'} = "$TUNECONFDIR/decoder_command.sequential";
-}
-
-my $OOV = ($GRAMMAR_TYPE eq "hiero" or $GRAMMAR_TYPE eq "itg" or $GRAMMAR_TYPE eq "phrase") ? "X" : "OOV";
+my $OOV = ($GRAMMAR_TYPE eq "hiero" or $GRAMMAR_TYPE eq "itg" or $GRAMMAR_TYPE eq "phrase" or $GRAMMAR_TYPE eq "moses") ? "X" : "OOV";
 
 # The phrasal system should use the ITG grammar, allowing for limited distortion
 if ($GRAMMAR_TYPE eq "phrasal") {
@@ -609,33 +616,27 @@ if ($TEST) {
   }
 }
 
-if ($FIRST_STEP ne "FIRST") {
-  if (@CORPORA > 1) {
-		print "* FATAL: you can't skip steps if you specify more than one --corpus\n";
-		exit(1);
-  }
-
-  if (eval { goto $FIRST_STEP }) {
-		print "* Skipping to step $FIRST_STEP\n";
-		goto $FIRST_STEP;
-  } else {
-		print "* No such step $FIRST_STEP\n";
-		exit 1;
-  }
-}
+# Record the preprocessing scripts that were used
+mkdir("scripts") unless -e "scripts";
+unlink "scripts/normalize.$SOURCE";
+unlink "scripts/normalize.$TARGET";
+symlink $NORMALIZER, "scripts/normalize.$SOURCE";
+symlink $NORMALIZER, "scripts/normalize.$TARGET";
+unlink "scripts/tokenize.$SOURCE";
+unlink "scripts/tokenize.$TARGET";
+symlink $TOKENIZER_SOURCE, "scripts/tokenize.$SOURCE";
+symlink $TOKENIZER_TARGET, "scripts/tokenize.$TARGET";
 
 ## STEP 1: filter and preprocess corpora #############################
-FIRST:
-    ;
 
-if (defined $ALIGNMENT) {
+if (defined $ALIGNMENT and $STEPS{$FIRST_STEP} < $STEPS{ALIGN}) {
   print "* FATAL: it doesn't make sense to provide an alignment and then do\n";
   print "  tokenization.  Either remove --alignment or specify a first step\n";
   print "  of Thrax (--first-step THRAX)\n";
   exit 1;
 }
 
-if (@CORPORA == 0) {
+if (@CORPORA == 0 and $STEPS{$FIRST_STEP} < $STEPS{TUNE}) {
   print "* FATAL: need at least one training corpus (--corpus)\n";
   exit 1;
 }
@@ -644,15 +645,15 @@ if (@CORPORA == 0) {
 my %PREPPED = (
   TRAIN => 0,
   TUNE => 0,
-  TEST => 0
-		);
+  TEST => 0);
 
-
-if ($DO_PREPARE_CORPORA) {
+if (@CORPORA > 0) {
   my $prefixes = prepare_data("train",\@CORPORA,$MAXLEN);
 
   # used for parsing
-  $TRAIN{mixedcase} = "$DATA_DIRS{train}/$prefixes->{shortened}.$TARGET.gz";
+  if (exists $prefixes->{shortened}) {
+    $TRAIN{mixedcase} = "$DATA_DIRS{train}/$prefixes->{shortened}.$TARGET.gz";
+  }
 
   $TRAIN{prefix} = "$DATA_DIRS{train}/corpus";
   $TRAIN{source} = "$DATA_DIRS{train}/corpus.$SOURCE";
@@ -661,10 +662,10 @@ if ($DO_PREPARE_CORPORA) {
 }
 
 # prepare the tuning and development data
-if (defined $TUNE and $DO_PREPARE_CORPORA) {
+if (defined $TUNE) {
   my $prefixes = prepare_data("tune",[$TUNE],$MAXLEN_TUNE);
-  $TUNE{source} = "$DATA_DIRS{tune}/$prefixes->{lowercased}.$SOURCE";
-  $TUNE{target} = "$DATA_DIRS{tune}/$prefixes->{lowercased}.$TARGET";
+  $TUNE{source} = "$DATA_DIRS{tune}/corpus.$SOURCE";
+  $TUNE{target} = "$DATA_DIRS{tune}/corpus.$TARGET";
   my $ner_return = ner_annotate("$TUNE{source}", "$TUNE{source}.ner", $SOURCE);
   if ($ner_return == 2) {
     $TUNE{source} = "$TUNE{source}.ner";
@@ -672,10 +673,10 @@ if (defined $TUNE and $DO_PREPARE_CORPORA) {
   $PREPPED{TUNE} = 1;
 }
 
-if (defined $TEST and $DO_PREPARE_CORPORA) {
+if (defined $TEST) {
   my $prefixes = prepare_data("test",[$TEST],$MAXLEN_TEST);
-  $TEST{source} = "$DATA_DIRS{test}/$prefixes->{lowercased}.$SOURCE";
-  $TEST{target} = "$DATA_DIRS{test}/$prefixes->{lowercased}.$TARGET";
+  $TEST{source} = "$DATA_DIRS{test}/corpus.$SOURCE";
+  $TEST{target} = "$DATA_DIRS{test}/corpus.$TARGET";
   my $ner_return = ner_annotate("$TEST{source}", "$TEST{source}.ner", $SOURCE);
   if ($ner_return == 2) {
     $TEST{source} = "$TEST{source}.ner";
@@ -683,7 +684,14 @@ if (defined $TEST and $DO_PREPARE_CORPORA) {
   $PREPPED{TEST} = 1;
 }
 
-maybe_quit("FIRST");
+## Use of GOTO considered very useful
+if (eval { goto $FIRST_STEP }) {
+  print "* Skipping to step $FIRST_STEP\n";
+  goto $FIRST_STEP;
+} else {
+  print "* No such step $FIRST_STEP\n";
+  exit 1;
+}
 
 ## SUBSAMPLE #########################################################
 
@@ -691,32 +699,32 @@ SUBSAMPLE:
     ;
 
 # subsample
-		if ($DO_SUBSAMPLE) {
-			mkdir("$DATA_DIRS{train}/subsampled") unless -d "$DATA_DIRS{train}/subsampled";
+if ($DO_SUBSAMPLE) {
+  mkdir("$DATA_DIRS{train}/subsampled") unless -d "$DATA_DIRS{train}/subsampled";
 
-			$cachepipe->cmd("subsample-manifest",
-											"echo corpus > $DATA_DIRS{train}/subsampled/manifest",
-											"$DATA_DIRS{train}/subsampled/manifest");
+  $cachepipe->cmd("subsample-manifest",
+                  "echo corpus > $DATA_DIRS{train}/subsampled/manifest",
+                  "$DATA_DIRS{train}/subsampled/manifest");
 
-			$cachepipe->cmd("subsample-testdata",
-											"cat $TUNE{source} $TEST{source} > $DATA_DIRS{train}/subsampled/test-data",
-											$TUNE{source},
-											$TEST{source},
-											"$DATA_DIRS{train}/subsampled/test-data");
+  $cachepipe->cmd("subsample-testdata",
+                  "cat $TUNE{source} $TEST{source} > $DATA_DIRS{train}/subsampled/test-data",
+                  $TUNE{source},
+                  $TEST{source},
+                  "$DATA_DIRS{train}/subsampled/test-data");
 
-			$cachepipe->cmd("subsample",
-											"java -Xmx4g -Dfile.encoding=utf8 -cp $JOSHUA/bin:$JOSHUA/lib/commons-cli-2.0-SNAPSHOT.jar joshua.subsample.Subsampler -e $TARGET -f $SOURCE -epath $DATA_DIRS{train}/ -fpath $DATA_DIRS{train}/ -output $DATA_DIRS{train}/subsampled/subsampled.$MAXLEN -ratio 1.04 -test $DATA_DIRS{train}/subsampled/test-data -training $DATA_DIRS{train}/subsampled/manifest",
-											"$DATA_DIRS{train}/subsampled/manifest",
-											"$DATA_DIRS{train}/subsampled/test-data",
-											$TRAIN{source},
-											$TRAIN{target},
-											"$DATA_DIRS{train}/subsampled/subsampled.$MAXLEN.$TARGET",
-											"$DATA_DIRS{train}/subsampled/subsampled.$MAXLEN.$SOURCE");
+  $cachepipe->cmd("subsample",
+                  "java -Xmx4g -Dfile.encoding=utf8 -cp $JOSHUA/bin:$JOSHUA/lib/commons-cli-2.0-SNAPSHOT.jar joshua.subsample.Subsampler -e $TARGET -f $SOURCE -epath $DATA_DIRS{train}/ -fpath $DATA_DIRS{train}/ -output $DATA_DIRS{train}/subsampled/subsampled.$MAXLEN -ratio 1.04 -test $DATA_DIRS{train}/subsampled/test-data -training $DATA_DIRS{train}/subsampled/manifest",
+                  "$DATA_DIRS{train}/subsampled/manifest",
+                  "$DATA_DIRS{train}/subsampled/test-data",
+                  $TRAIN{source},
+                  $TRAIN{target},
+                  "$DATA_DIRS{train}/subsampled/subsampled.$MAXLEN.$TARGET",
+                  "$DATA_DIRS{train}/subsampled/subsampled.$MAXLEN.$SOURCE");
 
-			# rewrite the symlinks to point to the subsampled corpus
-			foreach my $lang ($TARGET,$SOURCE) {
-				system("ln -sf subsampled/subsampled.$MAXLEN.$lang $DATA_DIRS{train}/corpus.$lang");
-			}
+  # rewrite the symlinks to point to the subsampled corpus
+  foreach my $lang ($TARGET,$SOURCE) {
+    system("ln -sf subsampled/subsampled.$MAXLEN.$lang $DATA_DIRS{train}/corpus.$lang");
+  }
 }
 
 maybe_quit("SUBSAMPLE");
@@ -801,10 +809,50 @@ if (! defined $ALIGNMENT) {
 
   system("mkdir alignments") unless -d "alignments";
 
-  if ($lastchunk == 0 || $NUM_JOBS == 1) {
-    system("seq 0 $lastchunk | $SCRIPTDIR/training/paralign.pl -aligner $ALIGNER -num_threads $NUM_THREADS -giza_merge $GIZA_MERGE -aligner_mem $ALIGNER_MEM -source $SOURCE -target $TARGET -giza_trainer \"$GIZA_TRAINER\" -train_dir \"$DATA_DIRS{train}\" > alignments/run.log");
-  } else {
-    system("seq 0 $lastchunk | $JOSHUA/scripts/training/parallelize/parallelize.pl --err err --jobs $NUM_JOBS --qsub-args \"$QSUB_ALIGN_ARGS\" -p $ALIGNER_MEM -- $SCRIPTDIR/training/paralign.pl -aligner $ALIGNER -num_threads $NUM_THREADS -giza_merge $GIZA_MERGE -aligner_mem $ALIGNER_MEM -source $SOURCE -target $TARGET -giza_trainer \"$GIZA_TRAINER\" -train_dir \"$DATA_DIRS{train}\" > alignments/run.log");
+  my $aligner_cmd = (
+    "$SCRIPTDIR/training/paralign.pl "
+    . " -aligner $ALIGNER"
+    . " -conf $ALIGNER_CONF"
+    . " -num_threads 2"
+    . " -giza_merge $GIZA_MERGE"
+    . " -aligner_mem $ALIGNER_MEM"
+    . " -source $SOURCE"
+    . " -target $TARGET"
+    . " -giza_trainer \"$GIZA_TRAINER\""
+    . " -train_dir \"$DATA_DIRS{train}\" "
+    . "> alignments/run.log"
+  );
+
+  # Start a parallel job on each core
+  my @children = ();
+  my $next_chunk = 0;
+  foreach my $core (1..$NUM_THREADS) {
+    if ($next_chunk < $lastchunk + 1) {
+      my $child = fork();
+      if (! $child) { # I am child
+        exec("echo $next_chunk | $aligner_cmd");
+        exit 0;
+      }
+      push @children, $child;
+      $next_chunk++;
+      next;
+    }
+  }
+
+  # Start another concurrent job as each oldest job finishes
+  while (@children) {
+    my $old_child = shift @children;
+    waitpid( $old_child, 0 );
+
+    if ($next_chunk < $lastchunk + 1) {
+      my $new_child = fork();
+      if (! $new_child) { # I am child
+        exec("echo $next_chunk | $aligner_cmd");
+        exit 0;
+      }
+      $next_chunk++;
+      push @children, $new_child;
+    }
   }
 
   my @aligned_files;
@@ -841,8 +889,8 @@ PARSE:
 
 # Parsing only happens for SAMT grammars.
 
-if ($FIRST_STEP eq "PARSE" and ($GRAMMAR_TYPE eq "hiero" or $GRAMMAR_TYPE eq "phrasal" or $GRAMMAR_TYPE eq "phrase")) {
-  print STDERR "* FATAL: parsing doesn't apply to hiero grammars; You need to add '--type samt|ghkm'\n";
+if ($FIRST_STEP eq "PARSE" and ($GRAMMAR_TYPE eq "hiero" or $GRAMMAR_TYPE eq "phrasal" or $GRAMMAR_TYPE eq "phrase" or $GRAMMAR_TYPE eq "moses")) {
+  print STDERR "* FATAL: parsing only applies to GHKM and SAMT grammars; you need to add '--type samt|ghkm'\n";
   exit;
 }
 
@@ -898,6 +946,8 @@ maybe_quit("PARSE");
 
 ## THRAX #############################################################
 
+MODEL:
+    ;
 GRAMMAR:
     ;
 THRAX:
@@ -955,17 +1005,18 @@ if (! defined $ALIGNMENT) {
   exit(1);
 }
 
-# Look for a pre-existing grammar, since building it is expensive, and something we want to
-# avoid if this is a rerun
+
+# Since this is an expensive step, we short-circuit it if the grammar file is present.  I'm not
+# sure that this is the right behavior.
 if (-e "grammar.gz" && ! -z "grammar.gz") {
   chomp(my $is_empty = `gzip -cd grammar.gz | head | wc -l`);
   $GRAMMAR_FILE = "grammar.gz" unless ($is_empty == 0);
 }
 
-# If the grammar file wasn't specified
+# If the grammar file wasn't specified, or found, we need to build it!
 if (! defined $GRAMMAR_FILE) {
 
-  my $target_file = ($GRAMMAR_TYPE eq "hiero" or $GRAMMAR_TYPE eq "phrasal" or $GRAMMAR_TYPE eq "phrase") ? $TRAIN{target} : $TRAIN{parsed};
+  my $target_file = ($GRAMMAR_TYPE eq "ghkm" or $GRAMMAR_TYPE eq "samt") ? $TRAIN{parsed} : $TRAIN{target};
 
   if ($GRAMMAR_TYPE eq "ghkm") {
     if ($GHKM_EXTRACTOR eq "galley") {
@@ -1016,9 +1067,7 @@ if (! defined $GRAMMAR_FILE) {
 
     $GRAMMAR_FILE = "grammar.gz";
 
-  } elsif ($GRAMMAR_TYPE eq "phrase") {
-
-    my $max_phrase_length = 5;
+  } elsif ($GRAMMAR_TYPE eq "moses") {
 
     mkdir("model") unless -d "model";
 
@@ -1030,7 +1079,7 @@ if (! defined $GRAMMAR_FILE) {
 
     # Compute lexical probabilities
     $cachepipe->cmd("build-lex-trans",
-                    "$MOSES/scripts/training/train-model.perl -mgiza -mgiza-cpus $NUM_THREADS -dont-zip -first-step 4 -last-step 4 -external-bin-dir $MOSES/bin -f $SOURCE -e $TARGET -max-phrase-length $max_phrase_length -score-options '--GoodTuring' -parallel -lexical-file model/lex -alignment-file alignments/training -alignment align -corpus $TRAIN{prefix}",
+                    "$MOSES/scripts/training/train-model.perl -mgiza -mgiza-cpus $NUM_THREADS -dont-zip -first-step 4 -last-step 4 -external-bin-dir $MOSES/bin -f $SOURCE -e $TARGET -max-phrase-length $MAX_PHRASE_LEN -score-options '--GoodTuring' -parallel -lexical-file model/lex -alignment-file alignments/training -alignment align -corpus $TRAIN{prefix}",
                     $TRAIN{source},
                     $TRAIN{target},
                     $ALIGNMENT,
@@ -1040,7 +1089,7 @@ if (! defined $GRAMMAR_FILE) {
 
     # Extract the phrases
     $cachepipe->cmd("extract-phrases",
-                    "$MOSES/scripts/training/train-model.perl -mgiza -mgiza-cpus $NUM_THREADS -dont-zip -first-step 5 -last-step 5 -external-bin-dir $MOSES/bin -f $SOURCE -e $TARGET -max-phrase-length $max_phrase_length -score-options '--GoodTuring' -parallel -alignment-file alignments/training -alignment align -extract-file model/extract -corpus $TRAIN{prefix}",
+                    "$MOSES/scripts/training/train-model.perl -mgiza -mgiza-cpus $NUM_THREADS -dont-zip -first-step 5 -last-step 5 -external-bin-dir $MOSES/bin -f $SOURCE -e $TARGET -max-phrase-length $MAX_PHRASE_LEN -score-options '--GoodTuring' -parallel -alignment-file alignments/training -alignment align -extract-file model/extract -corpus $TRAIN{prefix}",
                     $TRAIN{source},
                     $TRAIN{target},
                     $ALIGNMENT,
@@ -1050,24 +1099,21 @@ if (! defined $GRAMMAR_FILE) {
 
     # Build the phrase table
     $cachepipe->cmd("build-ttable",
-                    "$MOSES/scripts/training/train-model.perl -mgiza -mgiza-cpus $NUM_THREADS -dont-zip -first-step 6 -last-step 6 -external-bin-dir $MOSES/bin -f $SOURCE -e $TARGET -alignment grow-diag-final-and -max-phrase-length $max_phrase_length -score-options '--GoodTuring' -parallel -extract-file model/extract -lexical-file model/lex -phrase-translation-table model/phrase-table",
+                    "$MOSES/scripts/training/train-model.perl -mgiza -mgiza-cpus $NUM_THREADS -dont-zip -first-step 6 -last-step 6 -external-bin-dir $MOSES/bin -f $SOURCE -e $TARGET -alignment grow-diag-final-and -max-phrase-length $MAX_PHRASE_LEN -score-options '--GoodTuring' -parallel -extract-file model/extract -lexical-file model/lex -phrase-translation-table model/phrase-table",
                     "model/lex.e2f",
-                    "model/extract.sorted.gz"
+                    "model/extract.sorted.gz",
+                    "model/phrase-table.gz",
         );
 
     $GRAMMAR_FILE = "model/phrase-table.gz";
 
-  } elsif ($GRAMMAR_TYPE eq "samt" or $GRAMMAR_TYPE eq "hiero") {
-
-    # Since this is an expensive step, we short-circuit it if the grammar file is present.  I'm not
-    # sure that this is the right behavior.
+  } elsif ($GRAMMAR_TYPE eq "samt" or $GRAMMAR_TYPE eq "hiero" or $GRAMMAR_TYPE eq "phrase") {
 
     # create the input file
     $cachepipe->cmd("thrax-input-file",
-                    "paste $TRAIN{source} $target_file $ALIGNMENT | perl -pe 's/\\t/ ||| /g' | grep -v '()' | grep -v '||| \\+\$' > $DATA_DIRS{train}/thrax-input-file",
+                    "$PASTE $TRAIN{source} $target_file $ALIGNMENT | perl -pe 's/\\t/ ||| /g' | grep -v '()' | grep -v '||| \\+\$' > $DATA_DIRS{train}/thrax-input-file",
                     $TRAIN{source}, $target_file, $ALIGNMENT,
                     "$DATA_DIRS{train}/thrax-input-file");
-
 
     # Rollout the hadoop cluster if needed.  This causes $HADOOP to be defined (pointing to the
     # unrolled directory).
@@ -1076,7 +1122,7 @@ if (! defined $GRAMMAR_FILE) {
     # put the hadoop files in place
     my $THRAXDIR;
     my $thrax_input;
-    if ($HADOOP eq "hadoop") {
+    if (! defined $HADOOP or $HADOOP eq "") {
       $THRAXDIR = "thrax";
 
       $thrax_input = "$DATA_DIRS{train}/thrax-input-file"
@@ -1086,7 +1132,7 @@ if (! defined $GRAMMAR_FILE) {
       $THRAXDIR =~ s#/#_#g;
 
       $cachepipe->cmd("thrax-prep",
-                      "$HADOOP/bin/hadoop fs -rmr $THRAXDIR; $HADOOP/bin/hadoop fs -mkdir $THRAXDIR; $HADOOP/bin/hadoop fs -put $DATA_DIRS{train}/thrax-input-file $THRAXDIR/input-file",
+                      "$HADOOP/bin/hadoop fs -rm -r $THRAXDIR; $HADOOP/bin/hadoop fs -mkdir $THRAXDIR; $HADOOP/bin/hadoop fs -put $DATA_DIRS{train}/thrax-input-file $THRAXDIR/input-file",
                       "$DATA_DIRS{train}/thrax-input-file", 
                       "grammar.gz");
 
@@ -1100,7 +1146,7 @@ if (! defined $GRAMMAR_FILE) {
     system("mv $thrax_file.tmp $thrax_file");
 
     $cachepipe->cmd("thrax-run",
-                    "$HADOOP/bin/hadoop jar $THRAX/bin/thrax.jar -D mapred.child.java.opts='-Xmx$HADOOP_MEM' $thrax_file $THRAXDIR > thrax.log 2>&1; rm -f grammar grammar.gz; $HADOOP/bin/hadoop fs -getmerge $THRAXDIR/final/ grammar.gz; $HADOOP/bin/hadoop fs -rmr $THRAXDIR",
+                    "$HADOOP/bin/hadoop jar $THRAX/bin/thrax.jar -D mapred.child.java.opts='-Xmx$HADOOP_MEM' -D hadoop.tmp.dir=$TMPDIR $thrax_file $THRAXDIR > thrax.log 2>&1; rm -f grammar grammar.gz; $HADOOP/bin/hadoop fs -getmerge $THRAXDIR/final/ grammar.gz", #; $HADOOP/bin/hadoop fs -rm -r $THRAXDIR",
                     "$DATA_DIRS{train}/thrax-input-file",
                     $thrax_file,
                     "grammar.gz");
@@ -1109,15 +1155,15 @@ if (! defined $GRAMMAR_FILE) {
     stop_hadoop_cluster() if $HADOOP eq "hadoop";
 
     # cache the thrax-prep step, which depends on grammar.gz
-    if ($HADOOP ne "hadoop") {
-      $cachepipe->cmd("thrax-prep", "--cache-only");
-    }
+#    if ($HADOOP ne "hadoop") {
+#      $cachepipe->cmd("thrax-prep", "--cache-only");
+#    }
 
     # clean up
     # TODO: clean up real hadoop clusters too
-    if ($HADOOP eq "hadoop") {
-      system("rm -rf $THRAXDIR hadoop hadoop-0.20.2");
-    }
+    # if ($HADOOP eq "hadoop") {
+    #   system("rm -rf $THRAXDIR hadoop hadoop-2.5.2");
+    # }
 
     $GRAMMAR_FILE = "grammar.gz";
   } else {
@@ -1139,11 +1185,34 @@ TUNE:
     ;
 
 # prep the tuning data, unless already prepped
-if (! $PREPPED{TUNE} and $DO_PREPARE_CORPORA) {
+if (! $PREPPED{TUNE}) {
   my $prefixes = prepare_data("tune",[$TUNE],$MAXLEN_TUNE);
   $TUNE{source} = "$DATA_DIRS{tune}/$prefixes->{lowercased}.$SOURCE";
   $TUNE{target} = "$DATA_DIRS{tune}/$prefixes->{lowercased}.$TARGET";
   $PREPPED{TUNE} = 1;
+}
+
+
+# figure out how many references there are
+my $numrefs = get_numrefs($TUNE{target});
+
+# make sure the dev source exist
+if (! -e $TUNE{source}) {
+  print STDERR "* FATAL: couldn't fine tuning source file '$TUNE{source}'\n";
+  exit 1;
+}
+if ($numrefs > 1) {
+  for my $i (0..$numrefs-1) {
+		if (! -e "$TUNE{target}.$i") {
+			print STDERR "* FATAL: couldn't find tuning reference file '$TUNE{target}.$i'\n";
+			exit 1;
+		}
+  }
+} else {
+  if (! -e $TUNE{target}) {
+		print STDERR "* FATAL: couldn't find tuning reference file '$TUNE{target}'\n";
+		exit 1;
+  }
 }
 
 sub compile_lm($) {
@@ -1151,14 +1220,14 @@ sub compile_lm($) {
   if ($LM_TYPE eq "kenlm") {
     my $kenlm_file = basename($lmfile, ".gz") . ".kenlm";
     $cachepipe->cmd("compile-kenlm",
-                    "$JOSHUA/src/joshua/decoder/ff/lm/kenlm/build_binary $lmfile $kenlm_file",
+                    "$JOSHUA/bin/build_binary $lmfile $kenlm_file",
                     $lmfile, $kenlm_file);
     return $kenlm_file;
 
   } elsif ($LM_TYPE eq "berkeleylm") {
     my $berkeleylm_file = basename($lmfile, ".gz") . ".berkeleylm";
     $cachepipe->cmd("compile-berkeleylm",
-                    "java -cp $JOSHUA/lib/berkeleylm.jar -server -mx$BUILDLM_MEM edu.berkeley.nlp.lm.io.MakeLmBinaryFromArpa $lmfile $berkeleylm_file",
+                    "$JOSHUA/scripts/lm/compile_berkeley.py -m $BUILDLM_MEM $lmfile $berkeleylm_file",
                     $lmfile, $berkeleylm_file);
     return $berkeleylm_file;
 
@@ -1169,11 +1238,11 @@ sub compile_lm($) {
 }
 
 # Build the language model if needed
-if ($DO_BUILD_LM_FROM_CORPUS) {
+if (defined $TRAIN{target} and $DO_BUILD_LM_FROM_CORPUS) {
 
   # make sure the training data is prepped
-  if (! $PREPPED{TRAIN} and $DO_PREPARE_CORPORA) {
-		my $prefixes = prepare_data("train",\@CORPORA,$MAXLEN);
+  if (! $PREPPED{TRAIN}) {
+		my $prefixes = prepare_data("train", \@CORPORA, $MAXLEN);
 
 		$TRAIN{prefix} = "$DATA_DIRS{train}/corpus";
 		foreach my $lang ($SOURCE,$TARGET) {
@@ -1182,11 +1251,6 @@ if ($DO_BUILD_LM_FROM_CORPUS) {
 		$TRAIN{source} = "$DATA_DIRS{train}/corpus.$SOURCE";
 		$TRAIN{target} = "$DATA_DIRS{train}/corpus.$TARGET";
 		$PREPPED{TRAIN} = 1;
-  }
-
-  if (! -e $TRAIN{target}) {
-		print "* FATAL: I need a training corpus to build the language model from (--corpus)\n";
-		exit(1);
   }
 
   my $lmfile = "lm.gz";
@@ -1218,7 +1282,7 @@ if ($DO_BUILD_LM_FROM_CORPUS) {
 										$lmfile);
   } elsif ($LM_GEN eq "berkeleylm") {
 		$cachepipe->cmd("berkeleylm",
-										"java -ea -mx$BUILDLM_MEM -server -cp $JOSHUA/lib/berkeleylm.jar edu.berkeley.nlp.lm.io.MakeKneserNeyArpaFromText $LM_ORDER lm.gz $TRAIN{target}.uniq",
+				"java -ea -mx$BUILDLM_MEM -server -cp $JOSHUA/ext/berkeleylm/jar/berkeleylm.jar edu.berkeley.nlp.lm.io.MakeKneserNeyArpaFromText $LM_ORDER lm.gz $TRAIN{target}.uniq",
                     "$lm_input",
 										$lmfile);
   } else {
@@ -1266,8 +1330,8 @@ if ($DO_BUILD_CLASS_LM) {
   # Needs to be capitalized
   my $mem = uc $BUILDLM_MEM;
   my $class_lmfile = "class_lm.gz";
-  $cachepipe->cmd("kenlm",
-                  "$JOSHUA/bin/lmplz -o $LM_ORDER -T $TMPDIR -S $mem --discount_fallback=0.5 1 1.5 --verbose_header --text $CLASS_LM_CORPUS $LM_OPTIONS | gzip -9n > lm.gz",
+  $cachepipe->cmd("classlm",
+                  "$JOSHUA/bin/lmplz -o $CLASS_LM_ORDER -T $TMPDIR -S $mem --discount_fallback=0.5 1 1.5 --verbose_header --text $CLASS_LM_CORPUS $LM_OPTIONS | gzip -9n > $class_lmfile",
                   "$CLASS_LM_CORPUS",
                   $class_lmfile);
 }
@@ -1275,11 +1339,14 @@ if ($DO_BUILD_CLASS_LM) {
 if ($MERGE_LMS) {
   # Merge @LMFILES.
   my $merged_lm = "lm-merged.gz";
-  print "@LMFILES";
+
+  # Use the target first target reference if there are multiple ones
+  my $target_ref = (-e $TUNE{target}) ? $TUNE{target} : "$TUNE{target}.0";
+
   $cachepipe->cmd("merge-lms",
                   "$JOSHUA/scripts/support/merge_lms.py "
                     . "@LMFILES "
-                    . "$TUNE{target} "
+                    . "$target_ref "
                     . "lm-merged.gz "
                     . "--temp-dir data/merge_lms ",
                   @LMFILES,
@@ -1299,599 +1366,414 @@ if ($MERGE_LMS) {
 
 system("mkdir -p $DATA_DIRS{tune}") unless -d $DATA_DIRS{tune};
 
-# figure out how many references there are
-my $numrefs = get_numrefs($TUNE{target});
+# Set $TUNE_GRAMMAR to a specifically-passed tuning grammar or the
+# main default grammar. Then update it if filtering was requested and
+# is possible.
+my $TUNE_GRAMMAR = $_TUNE_GRAMMAR_FILE || $GRAMMAR_FILE;
+if ($DO_FILTER_TM and defined $GRAMMAR_FILE and ! $DOING_LATTICES and ! defined $_TUNE_GRAMMAR_FILE) {
+  $TUNE_GRAMMAR = "$DATA_DIRS{tune}/grammar.filtered.gz";
 
-# make sure the dev source exist
-if (! -e $TUNE{source}) {
-  print STDERR "* FATAL: couldn't fine tuning source file '$TUNE{source}'\n";
-  exit 1;
-}
-if ($numrefs > 1) {
-  for my $i (0..$numrefs-1) {
-		if (! -e "$TUNE{target}.$i") {
-			print STDERR "* FATAL: couldn't find tuning reference file '$TUNE{target}.$i'\n";
-			exit 1;
-		}
+  if ($OPTIMIZER_RUN == 1 and ! is_packed($TUNE_GRAMMAR)) {
+    $cachepipe->cmd("filter-tune",
+                    "$SCRIPTDIR/support/filter_grammar.sh -g $GRAMMAR_FILE $FILTERING -v $TUNE{source} | $SCRIPTDIR/training/filter-rules.pl -bus$SCOPE | gzip -9n > $TUNE_GRAMMAR",
+                    $GRAMMAR_FILE,
+                    $TUNE{source},
+                    "$DATA_DIRS{tune}/grammar.filtered.gz");
   }
-} else {
-  if (! -e $TUNE{target}) {
-		print STDERR "* FATAL: couldn't find tuning reference file '$TUNE{target}'\n";
-		exit 1;
-  }
-}
-
-
-# Filter the tuning grammar if it was requested (yes by default) and a tuned grammar was not passed
-# in explicitly.
-my $TUNE_GRAMMAR = (defined $TUNE_GRAMMAR_FILE)
-		? $TUNE_GRAMMAR_FILE
-		: $GRAMMAR_FILE;
-
-if ($DO_FILTER_TM and ! $DOING_LATTICES and ! defined $TUNE_GRAMMAR_FILE) {
-  $TUNE_GRAMMAR = $TUNE_GRAMMAR_FILE = "$DATA_DIRS{tune}/grammar.filtered.gz";
-
-  $cachepipe->cmd("filter-tune",
-									"$SCRIPTDIR/support/filter_grammar.sh -g $GRAMMAR_FILE $FILTERING -v $TUNE{source} | $SCRIPTDIR/training/filter-rules.pl -bus$SCOPE | gzip -9n > $TUNE_GRAMMAR",
-									$GRAMMAR_FILE,
-									$TUNE{source},
-									$TUNE_GRAMMAR);
-}
-
-# Pack the grammar, if requested (yes by default). This must be done after the glue grammar is
-# created, since we don't have a script (yet) to dump the rules from a packed grammar, which
-# information we need to create the glue grammar.
-if ($DO_PACK_GRAMMARS && ! is_packed($TUNE_GRAMMAR)) {
-  my $packed_dir = "$DATA_DIRS{tune}/grammar.packed";
-
-  $cachepipe->cmd("pack-tune",
-                  "$SCRIPTDIR/support/grammar-packer.pl -T $TMPDIR -m $PACKER_MEM $TUNE_GRAMMAR $packed_dir",
-                  $TUNE_GRAMMAR,
-                  "$packed_dir/vocabulary",
-                  "$packed_dir/encoding",
-                  "$packed_dir/slice_00000.source");
-
-  # $TUNE_GRAMMAR_FILE, which previously held an optional command-line argument of a pre-filtered
-  # tuning grammar, is now used to record the text-based grammar, which is needed later for
-  # different things.
-  $TUNE_GRAMMAR_FILE = $TUNE_GRAMMAR;
-
-  # The actual grammar used for decoding is the packed directory.
-  $TUNE_GRAMMAR = $packed_dir;
 }
 
 # Create the glue grammars. This is done by looking at all the symbols in the grammar file and
-# creating all the needed rules.
-if (! defined $GLUE_GRAMMAR_FILE) {
-  $cachepipe->cmd("glue-tune",
-                  "java -Xmx2g -cp $JOSHUA/lib/*:$THRAX/bin/thrax.jar edu.jhu.thrax.util.CreateGlueGrammar $TUNE_GRAMMAR > $DATA_DIRS{tune}/grammar.glue",
-                  $TUNE_GRAMMAR_FILE,
-                  "$DATA_DIRS{tune}/grammar.glue");
-  $GLUE_GRAMMAR_FILE = "$DATA_DIRS{tune}/grammar.glue";
-} else {
-  # just create a symlink to it
-  my $filename = $DATA_DIRS{tune} . "/" . basename($GLUE_GRAMMAR_FILE);
-  system("ln -sf $GLUE_GRAMMAR_FILE $filename");
-}
-
-# For each language model, we need to create an entry in the Joshua
-# config file and in ZMERT's params.txt file.  We use %lm_strings to
-# build the corresponding string substitutions
-my (@configstrings, @lmweightstrings, @lmparamstrings);
-for my $i (0..$#LMFILES) {
-  my $lmfile = $LMFILES[$i];
-  #GAURAV:TODO: Add case for when a Class LM is specified
-  if ($LM_STATE_MINIMIZATION) {
-    my $configstring = "feature-function = StateMinimizingLanguageModel -lm_order $LM_ORDER -lm_file $lmfile";
-    push (@configstrings, $configstring);
+# creating all the needed rules. This is only done if there is a $TUNE_GRAMMAR defined (which
+# can be skipped if we skip straight to the tuning step).
+if ($OPTIMIZER_RUN == 1 and defined $TUNE_GRAMMAR and $GRAMMAR_TYPE ne "phrase" and $GRAMMAR_TYPE ne "moses") {
+  if (! defined $GLUE_GRAMMAR_FILE) {
+    $cachepipe->cmd("glue-tune",
+                    "java -Xmx2g -cp $JOSHUA/lib/args4j-2.0.29.jar:$JOSHUA/class joshua.decoder.ff.tm.CreateGlueGrammar -g $TUNE_GRAMMAR > $DATA_DIRS{tune}/grammar.glue",
+                    get_file_from_grammar($TUNE_GRAMMAR),
+                    "$DATA_DIRS{tune}/grammar.glue");
+    $GLUE_GRAMMAR_FILE = "$DATA_DIRS{tune}/grammar.glue";
   } else {
-    my $configstring = "feature-function = LanguageModel -lm_type $LM_TYPE -lm_order $LM_ORDER -lm_file $lmfile";
-    push (@configstrings, $configstring);
+    # just create a symlink to it
+    my $filename = $DATA_DIRS{tune} . "/" . basename($GLUE_GRAMMAR_FILE);
+    system("ln -sf $GLUE_GRAMMAR_FILE $filename");
   }
-
-  # Add the Class LM as a feature function to the Joshua config file if available
-  if ($DO_BUILD_CLASS_LM) {
-    if (-e "class_lm.gz") {
-      my $configstring = "feature-function = LanguageModel -lm_type kenlm -lm_order $CLASS_LM_ORDER -minimizing false -lm_file class_lm.gz -lm_class -class_map $CLASS_MAP";
-      push (@configstrings, $configstring);
-    }
-    else {
-      print "The class lm flag was set but the class lm was not found";
-      exit 1;
-    }
-  }
-
-  my $weightstring = "lm_$i 1.0";
-  push (@lmweightstrings, $weightstring);
-
-  my $lmparamstring = "lm_$i        |||     1.000000 Opt     0.1     +Inf    +0.5    +1.5";
-  push (@lmparamstrings, $lmparamstring);
 }
 
-my $lmlines   = join($/, @configstrings);
-my $lmweights = join($/, @lmweightstrings);
-my $lmparams  = join($/, @lmparamstrings);
-
-my (@tmparamstrings, @tmweightstrings);
-open CONFIG, $TUNEFILES{'joshua.config'} or die;
-while (my $line = <CONFIG>) {
-  if ($line =~ /^tm\s*=/) {
-    $line =~ s/\s+$//;
-    my (undef,$grammarline) = split(/\s*=\s*/, $line);
-    my (undef,$owner,$span,$grammar) = split(' ', $grammarline);
-
-    next if ($GRAMMAR_TYPE eq "phrase" and $grammar =~ /<GLUE_GRAMMAR>/);
-
-    if ($grammar =~ /<GRAMMAR_FILE>/ or $grammar =~ /<GLUE_GRAMMAR>/) {
-      
-      my $grammar_file = ($grammar =~ /<GRAMMAR_FILE>/) ? $TUNE_GRAMMAR : $GLUE_GRAMMAR_FILE;
-
-      # Add the weights for the tuning grammar.
-      my @features = get_features($grammar_file);
-      foreach my $feature (@features) {
-        if ($feature =~ /^\d+$/) {  # dense feature
-          push (@tmparamstrings, "tm_${owner}_$feature ||| 1.0 Opt -Inf +Inf -1 +1");
-          push (@tmweightstrings, "tm_${owner}_$feature 1.0");
-        } else {  # sparse feature
-          push (@tmparamstrings, "$feature ||| 0.0 Opt -Inf +Inf -1 +1");
-          push (@tmweightstrings, "$feature 0.0");
-        }
-      }
-
-    } else {
-      # Add weights for any pre-supplied grammars.
-
-      my @features = get_features($grammar);
-      foreach my $feature (@features) {
-        if ($feature =~ /^\d+$/) {  # dense feature
-          push (@tmparamstrings, "tm_${owner}_$feature ||| 1.0 Opt -Inf +Inf -1 +1");
-          push (@tmweightstrings, "tm_${owner}_$feature 1.0");
-        } else {  # sparse feature
-          push (@tmparamstrings, "$feature ||| 0.0 Opt -Inf +Inf -1 +1");
-          push (@tmweightstrings, "$feature 0.0");
-        }
-      }
-		}
-	}
-}
-close CONFIG;
-
-my $tmparams = join($/, @tmparamstrings);
-my $tmweights = join($/, @tmweightstrings);
-
-my @otherparams;
-my @otherweights;
-
-if ($DOING_LATTICES) {
-  push @otherparams, "SourcePath ||| 1.0 Opt -Inf +Inf -1 +1";
-  push @otherweights, "SourcePath 1.0";
-}
-if ($GRAMMAR_TYPE eq "phrase") {
-  push @otherparams, "PhrasePenalty ||| 1.0 Opt -Inf +Inf -1 +1";
-  push @otherweights, "PhrasePenalty 1.0";
-
-  push @otherparams, "Distortion ||| 1.0 Opt -Inf +Inf -1 +1";
-  push @otherweights, "Distortion 1.0";
-}
-
-my $otherparams = join $/, @otherparams;
-my $otherweights = join $/, @otherweights;
-
+# Add in feature functions
+my $weightstr = "";
 my @feature_functions;
+my $lm_index = 0;
+for my $i (0..$#LMFILES) {
+  if ($LM_STATE_MINIMIZATION) {
+    push(@feature_functions, "StateMinimizingLanguageModel -lm_order $LM_ORDER -lm_file $LMFILES[$i]");
+  } else {
+    push(@feature_functions, "LanguageModel -lm_type $LM_TYPE -lm_order $LM_ORDER -lm_file $LMFILES[$i]");
+  }
+
+  $weightstr .= "lm_$i 1 ";
+  $lm_index += 1;
+}
+
+if ($DO_BUILD_CLASS_LM) {
+  push(@feature_functions, "LanguageModel -lm_type kenlm -lm_order 9 -lm_file $RUNDIR/class_lm.gz -class_map $CLASS_MAP");
+  $weightstr .= "lm_$lm_index 1 ";
+}
+
 if ($DOING_LATTICES) {
-  push(@feature_functions, "feature_function = SourcePath");
-}
-if ($GRAMMAR_TYPE eq "phrase") {
-  push(@feature_functions, "feature_function = Distortion");
-  push(@feature_functions, "feature_function = PhrasePenalty");
-}
-my $feature_functions = join("\n", @feature_functions);
+  push(@feature_functions, "SourcePath");
 
-for my $run (1..$OPTIMIZER_RUNS) {
-  my $tunedir = (defined $NAME) ? "tune/$NAME/$run" : "tune/$run";
+  $weightstr .= "SourcePath 1.0 ";
+}
+if ($GRAMMAR_TYPE eq "phrase" or $GRAMMAR_TYPE eq "moses") {
+  push(@feature_functions, "Distortion");
+  push(@feature_functions, "PhrasePenalty");
+
+  $weightstr .= "Distortion 1.0 PhrasePenalty 1.0 ";
+}
+my $feature_functions = join(" ", map { "-feature-function \"$_\"" } @feature_functions);
+
+# Build out the weight string
+my $TM_OWNER = "pt";
+my $GLUE_OWNER = "glue";
+if (defined $TUNE_GRAMMAR) {
+  my @tm_features = get_features($TUNE_GRAMMAR);
+  foreach my $feature (@tm_features) {
+    # Only assign initial weights to dense features
+    $weightstr .= "tm_${TM_OWNER}_$feature 1 " if ($feature =~ /^\d+$/);
+  }
+
+  # Glue grammars are only needed for hierarchical models
+  if ($GRAMMAR_TYPE ne "phrase" and $GRAMMAR_TYPE ne "moses") {
+    # Glue grammar
+    $weightstr .= "tm_${GLUE_OWNER}_0 1 ";
+  }
+}
+
+my $tm_type = $GRAMMAR_TYPE;
+if ($GRAMMAR_TYPE eq "moses") {
+  $tm_type = "moses";
+}
+
+sub get_file_from_grammar {
+  # Cachepipe doesn't work on directories, so we need to make sure we
+  # have a representative file to use to cache grammars. Returns undef if file not found
+  my ($grammar_file) = @_;
+  return undef unless defined $grammar_file and -e $grammar_file;
+  my $file = (-d $grammar_file) ? "$grammar_file/slice_00000.source" : $grammar_file;
+  return $file;
+}
+
+# The first tuning run is just a symlink to the tune/ directory (for backward compat.)
+# Subsequent runs are under their run number
+my $tunedir;
+if ($OPTIMIZER_RUN == 1) {
+  $tunedir = "$RUNDIR/tune";
   system("mkdir -p $tunedir") unless -d $tunedir;
+  symlink "$RUNDIR/tune", "$RUNDIR/tune/1";
+} else {
+  $tunedir = "$RUNDIR/tune/$OPTIMIZER_RUN";
+  system("mkdir -p $tunedir") unless -d $tunedir;
+}
 
-  my $tmtype = "thrax";
-  $tmtype = "moses" if $GRAMMAR_TYPE eq "phrase";
+system("mkdir -p $tunedir") unless -d $tunedir;
 
-  foreach my $key (keys %TUNEFILES) {
-		my $file = $TUNEFILES{$key};
-		open FROM, $file or die "can't find file '$file'";
-		open TO, ">$tunedir/$key" or die "can't write to file '$tunedir/$key'";
-		while (<FROM>) {
-			s/<INPUT>/$TUNE{source}/g;
-			s/<SOURCE>/$SOURCE/g;
-			s/<RUNDIR>/$RUNDIR/g;
-			s/<TARGET>/$TARGET/g;
-			s/<LMLINES>/$lmlines/g;
-			s/<LMWEIGHTS>/$lmweights/g;
-			s/<TMWEIGHTS>/$tmweights/g;
-			s/<LMPARAMS>/$lmparams/g;
-			s/<TMPARAMS>/$tmparams/g;
-      s/<FEATURE_FUNCTIONS>/$feature_functions/g;
-			s/<SEARCH_ALGORITHM>/$SEARCH_ALGORITHM/g;
-			s/<OTHERWEIGHTS>/$otherweights/g;
-			s/<OTHERPARAMS>/$otherparams/g;
-			s/<LMFILE>/$LMFILES[0]/g;
-			s/<LMTYPE>/$LM_TYPE/g;
-			s/<MEM>/$JOSHUA_MEM/g;
-			s/<GRAMMAR_TYPE>/$GRAMMAR_TYPE/g;
-			s/<GRAMMAR_FILE>/$TUNE_GRAMMAR/g;
-      s/<GRAMMAR_KEYWORD>/$tmtype/g;
-			s/<GLUE_GRAMMAR>/$GLUE_GRAMMAR_FILE/g;
-			s/<MAXSPAN>/$MAXSPAN/g;
-			s/<OOV>/$OOV/g;
-			s/<NUMJOBS>/$NUM_JOBS/g;
-			s/<NUMTHREADS>/$NUM_THREADS/g;
-			s/<QSUB_ARGS>/$QSUB_ARGS/g;
-			s/<OUTPUT>/$tunedir\/tune.output.nbest/g;
-			s/<REF>/$TUNE{target}/g;
-			s/<JOSHUA>/$JOSHUA/g;
-			s/<JOSHUA_ARGS>/$JOSHUA_ARGS/g;
-			s/<NUMREFS>/$numrefs/g;
-			s/<CONFIG>/$tunedir\/joshua.config/g;
-			s/<LOG>/$tunedir\/joshua.log/g;
-			s/<TUNEDIR>/$tunedir/g;
-			s/<MERTDIR>/$tunedir/g;   # for backwards compatibility
-			s/use_sent_specific_tm=.*/use_sent_specific_tm=0/g;
-      s/<REORDERING_LIMIT>/$REORDERING_LIMIT/g;
-      s/<NUM_TRANSLATION_OPTIONS>/$NUM_TRANSLATION_OPTIONS/g;
-			print TO;
-		}
-		close(FROM);
-		close(TO);
+# Build the filtered tuning model
+my $tunemodeldir = "$RUNDIR/tune/model";
+
+# We build up this string with TMs to substitute in, if any are provided
+my $tm_switch = "";
+my $tm_copy_config_args = "";
+if (defined $TUNE_GRAMMAR) {
+  $tm_switch .= ($DO_PACK_GRAMMARS) ? "--pack-tm" : "--tm";
+  $tm_switch .= " $TUNE_GRAMMAR";
+  $tm_copy_config_args = " -tm0/type $tm_type -tm0/owner ${TM_OWNER} -tm0/maxspan $MAXSPAN";
+}
+# If we specified a new glue grammar, put that in
+if ($GRAMMAR_TYPE eq "phrase" or $GRAMMAR_TYPE eq "moses") {
+  # if there is no glue grammar, remove it from the config template
+  $tm_copy_config_args .= " -tm1 DELETE";
+} elsif (defined $GLUE_GRAMMAR_FILE) {
+  $tm_switch .= " --tm $GLUE_GRAMMAR_FILE";
+  $tm_copy_config_args .= " -tm1/owner ${GLUE_OWNER}";
+}
+
+# Now build the bundle
+if ($OPTIMIZER_RUN == 1) {
+  $cachepipe->cmd("tune-bundle",
+                  "$BUNDLER --force --symlink --absolute --verbose -T $TMPDIR $JOSHUA_CONFIG $tunemodeldir --copy-config-options '-top-n $NBEST -output-format \"%i ||| %s ||| %f ||| %c\" -mark-oovs false -search $SEARCH_ALGORITHM -weights \"$weightstr\" $feature_functions ${tm_copy_config_args}' ${tm_switch}",
+                  $JOSHUA_CONFIG,
+                  get_file_from_grammar($TUNE_GRAMMAR) || $JOSHUA_CONFIG,
+                  "$tunemodeldir/run-joshua.sh");
+}
+
+# Update the tune grammar to its new location in the bundle
+if (defined $TUNE_GRAMMAR) {
+  # Now update the tuning grammar to its new path
+  my $basename = basename($TUNE_GRAMMAR);
+  if (-e "tune/model/$basename") {
+    $TUNE_GRAMMAR = "tune/model/$basename";
+  } elsif (-e "tune/model/$basename.packed") {
+    $TUNE_GRAMMAR = "tune/model/$basename.packed";
+  } else {
+    print STDERR "* FATAL: tune model bundling didn't produce a grammar?";
+    exit 1;
   }
-  chmod(0755,"$tunedir/decoder_command");
+}
 
-  # tune
-  if ($TUNER eq "mert") {
-		$cachepipe->cmd("mert-$run",
-										"java -d64 -Xmx$TUNER_MEM -cp $JOSHUA/class joshua.zmert.ZMERT -maxMem 4000 $tunedir/mert.config > $tunedir/mert.log 2>&1",
-										$TUNE_GRAMMAR_FILE,
-										"$tunedir/joshua.config.ZMERT.final",
-										"$tunedir/decoder_command",
-										"$tunedir/mert.config",
-										"$tunedir/params.txt");
-		system("ln -sf joshua.config.ZMERT.final $tunedir/joshua.config.final");
-  } elsif ($TUNER eq "pro") {
-		$cachepipe->cmd("pro-$run",
-										"java -d64 -Xmx$TUNER_MEM -cp $JOSHUA/class joshua.pro.PRO -maxMem 4000 $tunedir/pro.config > $tunedir/pro.log 2>&1",
-										$TUNE_GRAMMAR_FILE,
-										"$tunedir/joshua.config.PRO.final",
-										"$tunedir/decoder_command",
-										"$tunedir/pro.config",
-										"$tunedir/params.txt");
-		system("ln -sf joshua.config.PRO.final $tunedir/joshua.config.final");
-  } elsif ($TUNER eq "mira") {
-    my $refs_path = $TUNE{target};
-    $refs_path .= "." if (get_numrefs($TUNE{target}) > 1);
+# Copy the generated config to the tunedir, and update the config file location
+system("cp $tunemodeldir/joshua.config $tunedir/joshua.config");
+$JOSHUA_CONFIG = "$tunedir/joshua.config";
 
-    my $extra_args = $JOSHUA_ARGS;
-    $extra_args =~ s/"/\\"/g;
-    $cachepipe->cmd("mira-$run",
-                    "$SCRIPTDIR/training/mira/run-mira.pl --mertdir $MOSES/bin --rootdir $MOSES/scripts --batch-mira --working-dir $tunedir --maximum-iterations $MIRA_ITERATIONS --return-best-dev --nbest $NBEST --no-filter-phrase-table --decoder-flags \"-m $JOSHUA_MEM -threads $NUM_THREADS -moses $extra_args\" $TUNE{source} $refs_path $JOSHUA/bin/decoder $tunedir/joshua.config > $tunedir/mira.log 2>&1",
-                    $TUNE_GRAMMAR_FILE,
-                    $TUNE{source},
-                    "$tunedir/joshua.config.final");
-  }
+# Write the decoder run command. The decoder will use the config file in the bundled
+# directory, continually updating it.
 
-  # Go to the next tuning run if tuning is the last step.
-  if ($LAST_STEP eq "TUNE") {
-    next;
-  }
+# If we're decoding a lattice, also output the source side path we chose
+$JOSHUA_ARGS = "";
+if ($DOING_LATTICES) {
+  $JOSHUA_ARGS .= " -maxlen 0 -lattice-decoding";
+}
+$JOSHUA_ARGS .= " -output-format \"%i ||| %s ||| %f ||| %c\"";
+$JOSHUA_ARGS .= " $_JOSHUA_ARGS" if defined $_JOSHUA_ARGS;
 
+open DEC_CMD, ">$tunedir/decoder_command";
+print DEC_CMD "cat $TUNE{source} | $tunemodeldir/run-joshua.sh -m $JOSHUA_MEM -config $JOSHUA_CONFIG -threads $NUM_THREADS $JOSHUA_ARGS > $tunedir/output.nbest 2> $tunedir/joshua.log\n";
+close(DEC_CMD);
+chmod(0755,"$tunedir/decoder_command");
+
+# tune
+if ($TUNER ne "kbmira") {
+  $cachepipe->cmd("${TUNER}-${OPTIMIZER_RUN}",
+                  "$SCRIPTDIR/training/run_tuner.py $TUNE{source} $TUNE{target} --tunedir $tunedir --tuner $TUNER --decoder $tunedir/decoder_command --decoder-config $JOSHUA_CONFIG --decoder-output-file $tunedir/output.nbest --decoder-log-file $tunedir/joshua.log --iterations $TUNER_ITERATIONS --metric '$METRIC'",
+                  $TUNE{source},
+                  $JOSHUA_CONFIG,
+                  get_file_from_grammar($TUNE_GRAMMAR) || $JOSHUA_CONFIG,
+                  "$tunedir/joshua.config.final");
+
+} else { # Moses' batch kbmira
+  my $refs_path = $TUNE{target};
+  $refs_path .= "." if (get_numrefs($TUNE{target}) > 1);
+
+  my $extra_args = $JOSHUA_ARGS;
+  $extra_args =~ s/"/\\"/g;
+  $cachepipe->cmd("kbmira-${OPTIMIZER_RUN}",
+                  "$SCRIPTDIR/training/mira/run-mira.pl --mertdir $MOSES/bin --rootdir $MOSES/scripts --batch-mira --working-dir $tunedir --maximum-iterations $TUNER_ITERATIONS --nbest $NBEST --no-filter-phrase-table --decoder-flags \"-m $JOSHUA_MEM -threads $NUM_THREADS -moses $extra_args\" $TUNE{source} $refs_path $tunemodeldir/run-joshua.sh $JOSHUA_CONFIG > $tunedir/mira.log 2>&1",
+                  get_file_from_grammar($TUNE_GRAMMAR) || $JOSHUA_CONFIG,
+                  $TUNE{source},
+                  "$tunedir/joshua.config.final");
+}
+
+$JOSHUA_CONFIG = "$tunedir/joshua.config.final";
+
+# Go to the next tuning run if tuning is the last step.
+maybe_quit("TUNE");
+
+#################################################################
+## TESTING ######################################################
+#################################################################
+
+TEST:
+    ;
 
 # prepare the testing data
-  if (! $PREPPED{TEST} and $DO_PREPARE_CORPORA) {
-    my $prefixes = prepare_data("test",[$TEST],$MAXLEN_TEST);
-    $TEST{source} = "$DATA_DIRS{test}/$prefixes->{lowercased}.$SOURCE";
-    $TEST{target} = "$DATA_DIRS{test}/$prefixes->{lowercased}.$TARGET";
-    $PREPPED{TEST} = 1;
+if (! $PREPPED{TEST} and $OPTIMIZER_RUN == 1) {
+  my $prefixes = prepare_data("test", [$TEST], $MAXLEN_TEST);
+  $TEST{source} = "$DATA_DIRS{test}/$prefixes->{lowercased}.$SOURCE";
+  $TEST{target} = "$DATA_DIRS{test}/$prefixes->{lowercased}.$TARGET";
+  $PREPPED{TEST} = 1;
+}
+
+system("mkdir -p $DATA_DIRS{test}") unless -d $DATA_DIRS{test};
+
+# Define the test grammar, if it was provided
+my $TEST_GRAMMAR = $_TEST_GRAMMAR_FILE || $GRAMMAR_FILE;
+
+if ($DO_FILTER_TM and defined $GRAMMAR_FILE and ! $DOING_LATTICES and ! defined $_TEST_GRAMMAR_FILE) {
+  # On the first test run, we take some pains to prepare and pack the model, which won't have
+  # to be done for subsequent runs
+  if ($OPTIMIZER_RUN == 1 and ! is_packed($TEST_GRAMMAR)) {
+    $TEST_GRAMMAR = "$DATA_DIRS{test}/grammar.filtered.gz";
+
+    $cachepipe->cmd("filter-test",
+                    "$SCRIPTDIR/support/filter_grammar.sh -g $GRAMMAR_FILE $FILTERING -v $TEST{source} | $SCRIPTDIR/training/filter-rules.pl -bus$SCOPE | gzip -9n > $TEST_GRAMMAR",
+                    $GRAMMAR_FILE,
+                    $TEST{source},
+                    "$DATA_DIRS{test}/grammar.filtered.gz");
   }
+}
 
-# filter the test grammar
-  system("mkdir -p $DATA_DIRS{test}") unless -d $DATA_DIRS{test};
-  my $TEST_GRAMMAR;
-  if ($TEST_GRAMMAR_FILE) {
-    # if a specific test grammar was specified, use that (no filtering)
-    $TEST_GRAMMAR = $TEST_GRAMMAR_FILE;
-  } else {
-    # otherwise, use the main grammar, and filter it if requested
-    $TEST_GRAMMAR = $TEST_GRAMMAR_FILE = $GRAMMAR_FILE;
-    
-    if ($DO_FILTER_TM and ! $DOING_LATTICES) {
-      $TEST_GRAMMAR = $TEST_GRAMMAR_FILE = "$DATA_DIRS{test}/grammar.filtered.gz";
-
-      $cachepipe->cmd("filter-test",
-                      "$SCRIPTDIR/support/filter_grammar.sh -g $GRAMMAR_FILE $FILTERING -v $TEST{source} | $SCRIPTDIR/training/filter-rules.pl -bus$SCOPE | gzip -9n > $TEST_GRAMMAR",
-                      $GRAMMAR_FILE,
-                      $TEST{source},
-                      $TEST_GRAMMAR);
-    }
-  }
-
-	# Pack the grammar.
-	if ($DO_PACK_GRAMMARS && ! is_packed($TEST_GRAMMAR)) {
-    my $packed_dir = "$DATA_DIRS{test}/grammar.packed";
-
-    $cachepipe->cmd("pack-test",
-                    "$SCRIPTDIR/support/grammar-packer.pl -T $TMPDIR -m $PACKER_MEM $TEST_GRAMMAR $packed_dir",
-                    $TEST_GRAMMAR,
-                    "$packed_dir/vocabulary",
-                    "$packed_dir/encoding",
-                    "$packed_dir/slice_00000.source");
-
-    # $TEST_GRAMMAR_FILE, which previously held an optional command-line argument of a pre-filtered
-    # tuning grammar, is now used to record the text-based grammar, which is needed later for
-    # different things.
-    $TEST_GRAMMAR_FILE = $TEST_GRAMMAR;
-
-    # The actual grammar used for decoding is the packed directory.
-    $TEST_GRAMMAR = $packed_dir;
-  } else {
-    $TEST_GRAMMAR = $TEST_GRAMMAR_FILE;
-  }
-  	
-  # Create the glue file.
+# Create the glue grammar
+if ($OPTIMIZER_RUN == 1 and defined $TEST_GRAMMAR and $GRAMMAR_TYPE ne "phrase" and $GRAMMAR_TYPE ne "moses") {
   if (! defined $GLUE_GRAMMAR_FILE) {
     $cachepipe->cmd("glue-test",
-    "java -Xmx1g -cp $JOSHUA/lib/*:$THRAX/bin/thrax.jar edu.jhu.thrax.util.CreateGlueGrammar $TEST_GRAMMAR > $DATA_DIRS{test}/grammar.glue",
-    $TEST_GRAMMAR,
-    "$DATA_DIRS{test}/grammar.glue");
+                    "java -Xmx2g -cp $JOSHUA/lib/args4j-2.0.29.jar:$JOSHUA/class joshua.decoder.ff.tm.CreateGlueGrammar -g $TEST_GRAMMAR > $DATA_DIRS{test}/grammar.glue",
+                    get_file_from_grammar($TEST_GRAMMAR),
+                    "$DATA_DIRS{test}/grammar.glue");
     $GLUE_GRAMMAR_FILE = "$DATA_DIRS{test}/grammar.glue";
     
   } else {
     # just create a symlink to it
     my $filename = $DATA_DIRS{test} . "/" . basename($GLUE_GRAMMAR_FILE);
-    
     if ($GLUE_GRAMMAR_FILE =~ /^\//) {
       system("ln -sf $GLUE_GRAMMAR_FILE $filename");
     } else {
       system("ln -sf $STARTDIR/$GLUE_GRAMMAR_FILE $filename");
     }
   }
-
-  my $testrun = (defined $NAME) ? "test/$NAME/$run" : "test/$run";
-  system("mkdir -p $testrun") unless -d $testrun;
-  $testrun = get_absolute_path($testrun, $RUNDIR);
-
-  # If we're decoding a lattice, also output the source side path we chose
-  my $joshua_args = $JOSHUA_ARGS;
-  if ($DOING_LATTICES) {
-    $joshua_args .= " -maxlen 0 -output-format \"%i ||| %s ||| %e ||| %f ||| %c\"";
-  }
-
-  foreach my $key (qw(decoder_command)) {
-		my $file = $TUNEFILES{$key};
-		open FROM, $file or die "can't find file '$file'";
-		open TO, ">$testrun/$key" or die "can't write to '$testrun/$key'";
-		while (<FROM>) {
- 			s/<INPUT>/$TEST{source}/g;
-			s/<NUMJOBS>/$NUM_JOBS/g;
-			s/<NUMTHREADS>/$NUM_THREADS/g;
-			s/<QSUB_ARGS>/$QSUB_ARGS/g;
-			s/<OUTPUT>/$testrun\/test.output.nbest/g;
-			s/<JOSHUA>/$JOSHUA/g;
-			s/<JOSHUA_ARGS>/$joshua_args/g;
-			s/<NUMREFS>/$numrefs/g;
-			s/<SOURCE>/$SOURCE/g;
-			s/<TARGET>/$TARGET/g;
-			s/<RUNDIR>/$TARGET/g;
-			s/<LMFILE>/$LMFILES[0]/g;
-			s/<MEM>/$JOSHUA_MEM/g;
-			s/<GRAMMAR_TYPE>/$GRAMMAR_TYPE/g;
-			s/<GRAMMAR_FILE>/$TEST_GRAMMAR/g;
-			s/<GLUE_GRAMMAR>/$GLUE_GRAMMAR_FILE/g;
-			s/<OOV>/$OOV/g;
-			s/<CONFIG>/$testrun\/joshua.config/g;
-			s/<LOG>/$testrun\/joshua.log/g;
-
-			print TO;
-		}
-		close(FROM);
-		close(TO);
-  }
-  chmod(0755,"$testrun/decoder_command");
-
-  # Copy the config file over.
-  $cachepipe->cmd("test-joshua-config-from-tune-$run",
-                  "cat $tunedir/joshua.config.final | $COPY_CONFIG -mark-oovs false -tm '$tmtype pt $MAXSPAN $TEST_GRAMMAR' > $testrun/joshua.config",
-									"$tunedir/joshua.config.final",
-									"$testrun/joshua.config");
-
-  $cachepipe->cmd("test-decode-$run",
-									"$testrun/decoder_command",
-                  $TEST{source},
-									"$DATA_DIRS{test}/grammar.glue",
-									$TEST_GRAMMAR_FILE,
-									"$testrun/test.output.nbest");
-
-  $cachepipe->cmd("remove-oov-$run",
-									"cat $testrun/test.output.nbest | perl -pe 's/_OOV//g' > $testrun/test.output.nbest.noOOV",
-									"$testrun/test.output.nbest",
-									"$testrun/test.output.nbest.noOOV");
-
-  my $output = "$testrun/test.output.1best";
-  $numrefs = get_numrefs($TEST{target});
-
-  # Always compute the BLEU score on the regular 1-best output, since it's easy to do
-  $cachepipe->cmd("test-extract-onebest-$run",
-                  "java -Xmx500m -cp $JOSHUA/class -Dfile.encoding=utf8 joshua.util.ExtractTopCand $testrun/test.output.nbest.noOOV $output",
-                  "$testrun/test.output.nbest.noOOV", 
-                  $output);
-
-  $cachepipe->cmd("test-bleu-$run",
-									"java -cp $JOSHUA/class -Dfile.encoding=utf8 -Djava.library.path=lib -Xmx1000m -Xms1000m -Djava.util.logging.config.file=logging.properties joshua.util.JoshuaEval -cand $output -ref $TEST{target} -rps $numrefs -m BLEU 4 closest > $testrun/test.output.1best.bleu",
-									$output,
-									"$output.bleu");
-
-  # We can also rescore the output lattice with MBR
-  if ($DO_MBR) {
-		my $numlines = `cat $TEST{source} | wc -l`;
-		$numlines--;
-    $output .= ".mbr";
-
-		$cachepipe->cmd("test-onebest-parmbr-$run", 
-										"cat $testrun/test.output.nbest.noOOV | java -Xmx1700m -cp $JOSHUA/class -Dfile.encoding=utf8 joshua.decoder.NbestMinRiskReranker false 1 $NUM_THREADS > $output",
-										"$testrun/test.output.nbest.noOOV", 
-										$output);
-
-    $cachepipe->cmd("test-bleu-mbr-$run",
-                    "java -cp $JOSHUA/class -Dfile.encoding=utf8 -Djava.library.path=lib -Xmx1000m -Xms1000m -Djava.util.logging.config.file=logging.properties joshua.util.JoshuaEval -cand $output -ref $TEST{target} -rps $numrefs -m BLEU 4 closest > $testrun/test.output.1best.mbr.bleu",
-                    $output,
-                    "$output.bleu");
-  }
-
-  # Update the BLEU summary.
-  my $dir = (defined $NAME) ? "test/$NAME" : "test";
-  compute_bleu_summary("$dir/*/*.1best.bleu", "$dir/final-bleu");
-  compute_bleu_summary("$dir/*/*.1best.mbr.bleu", "$dir/final-bleu-mbr");
-  compute_time_summary("$dir/*/joshua.log", "$dir/final-times");
-
-  # Now do the analysis
-  if ($DOING_LATTICES) {
-    # extract the source
-    my $source = "$testrun/test.lattice-path.txt";
-    $cachepipe->cmd("test-lattice-extract-source-$run",
-                    "$JOSHUA/bin/extract-1best $testrun/test.output.nbest.noOOV 2 | perl -pe 's/<s> //' > $source",
-                    $output, $source);
-
-    analyze_testrun($output,$source,$TEST{target});
-  } else {
-    analyze_testrun($output,$TEST{source},$TEST{target});
-  }
 }
 
-exit;
-
-# This target allows the pipeline to be used just for decoding new
-# data sets
-
-TEST:
-    ;
-
-system("mkdir -p $DATA_DIRS{test}") unless -d $DATA_DIRS{test};
-
-if (! defined $NAME) {
-  print "* FATAL: for direct tests, you must specify a unique run name\n";
-  exit 1;
-}
-
-# if (-e "$DATA_DIRS{test}/$NAME") {
-#   print "* FATAL: you specified a run name, but it already exists\n";
-#   exit 1;
-# }
-
-if (! $PREPPED{TEST} and $DO_PREPARE_CORPORA) {
-  my $prefixes = prepare_data("test",[$TEST],$MAXLEN_TEST);
-  $TEST{source} = "$DATA_DIRS{test}/$prefixes->{lowercased}.$SOURCE";
-  $TEST{target} = "$DATA_DIRS{test}/$prefixes->{lowercased}.$TARGET";
-  $PREPPED{TEST} = 1;
-}
-
-my $testrun = "test/$NAME";
-system("mkdir -p $testrun") unless -d $testrun;
-
-# filter the test grammar
-my $TEST_GRAMMAR;
-if ($TEST_GRAMMAR_FILE) {
-  # if a specific test grammar was specified, use that (no filtering)
-  $TEST_GRAMMAR = $TEST_GRAMMAR_FILE;
+# Create the test directory
+my $testdir;
+if ($OPTIMIZER_RUN == 1) {
+  $testdir = "$RUNDIR/test";
+  system("mkdir -p $testdir") unless -d $testdir;
+  symlink("$RUNDIR/test", "$RUNDIR/test/1");
 } else {
-  # otherwise, use the main grammar, and filter it if requested
-  $TEST_GRAMMAR = $TEST_GRAMMAR_FILE = $GRAMMAR_FILE;
-  
-  if ($DO_FILTER_TM and ! $DOING_LATTICES) {
-		$TEST_GRAMMAR = "$DATA_DIRS{test}/grammar.filtered.gz";
-		$cachepipe->cmd("filter-test-$NAME",
-                "$SCRIPTDIR/support/filter_grammar.sh -g $GRAMMAR_FILE $FILTERING -v $TEST{source} | $SCRIPTDIR/training/filter-rules.pl -bus$SCOPE | gzip -9n > $TEST_GRAMMAR",
-                $GRAMMAR_FILE,
-                $TEST{source},
-                $TEST_GRAMMAR);
-  }
+  $testdir = "$RUNDIR/test/$OPTIMIZER_RUN";
+  system("mkdir -p $testdir") unless -d $testdir;
 }
 
-# build the glue grammar if needed
-if (! defined $GLUE_GRAMMAR_FILE) {
-  $cachepipe->cmd("glue-test-$NAME",
-									"java -Xmx2g -cp $JOSHUA/lib/*:$THRAX/bin/thrax.jar edu.jhu.thrax.util.CreateGlueGrammar $TEST_GRAMMAR > $DATA_DIRS{test}/grammar.glue",
-									$TEST_GRAMMAR,
-									"$DATA_DIRS{test}/grammar.glue");
-  $GLUE_GRAMMAR_FILE = "$DATA_DIRS{test}/grammar.glue";
-}
-
-if ($TUNEFILES{'joshua.config'} eq $JOSHUA_CONFIG_ORIG) {
-  print "* FATAL: for direct tests, I need a (tuned) Joshua config file\n";
-  exit 1;
-}
-
-if ($DO_PACK_GRAMMARS && ! is_packed($TEST_GRAMMAR)) {
+$tm_switch = "";
+$tm_copy_config_args = "";
+if ($DO_PACK_GRAMMARS) {
   my $packed_dir = "$DATA_DIRS{test}/grammar.packed";
-
-  $cachepipe->cmd("pack-test",
-                  "$SCRIPTDIR/support/grammar-packer.pl -T $TMPDIR -m $PACKER_MEM $TEST_GRAMMAR $packed_dir",
-                  $TEST_GRAMMAR,
-                  "$packed_dir/vocabulary",
-                  "$packed_dir/encoding",
-                  "$packed_dir/slice_00000.source");
-
-  # $TEST_GRAMMAR_FILE, which previously held an optional command-line argument of a pre-filtered
-  # tuning grammar, is now used to record the text-based grammar, which is needed later for
-  # different things.
-  $TEST_GRAMMAR_FILE = $TEST_GRAMMAR;
-
-  # The actual grammar used for decoding is the packed directory.
+  if ($OPTIMIZER_RUN == 1 and ! is_packed($TEST_GRAMMAR)) {
+    $cachepipe->cmd("test-pack",
+                    "$SCRIPTDIR/support/grammar-packer.pl -T $TMPDIR -m $PACKER_MEM -g $TEST_GRAMMAR -o $packed_dir",
+                    $TEST_GRAMMAR,
+                    "$packed_dir/vocabulary",
+                    "$packed_dir/encoding",
+                    "$packed_dir/slice_00000.source");
+  }
   $TEST_GRAMMAR = $packed_dir;
+
+  $tm_switch .= " --pack-tm $TEST_GRAMMAR";
 } else {
-  $TEST_GRAMMAR = $TEST_GRAMMAR_FILE;
+  $tm_switch .= " --tm $TEST_GRAMMAR";
 }
 
-# this needs to be in a function since it is done all over the place
-open TO, ">$testrun/decoder_command";
-print TO "cat $TEST{source} | \$JOSHUA/bin/joshua-decoder -m $JOSHUA_MEM -threads $NUM_THREADS -c $testrun/joshua.config > $testrun/test.output.nbest 2> $testrun/joshua.log\n";
-close(TO);
-chmod(0755,"$testrun/decoder_command");
+# Add in the glue grammar
+if (defined $GLUE_GRAMMAR_FILE) {
+  $tm_switch .= " --tm $GLUE_GRAMMAR_FILE";
+}
 
-# copy over the config file
-my $tmtype = "thrax";
-$tmtype = "phrase" if $GRAMMAR_TYPE eq "phrase";
-$cachepipe->cmd("test-$NAME-copy-config",
-                "cat $TUNEFILES{'joshua.config'} | $COPY_CONFIG -mark-oovs false -tm/pt '$tmtype pt $MAXSPAN $TEST_GRAMMAR' -default-non-terminal $OOV -search $SEARCH_ALGORITHM > $testrun/joshua.config",
-                $TUNEFILES{'joshua.config'},
-                "$testrun/joshua.config");
+# Build the test model
+my $testmodeldir = "$RUNDIR/test/$OPTIMIZER_RUN/model";
+$cachepipe->cmd("test-bundle-${OPTIMIZER_RUN}",
+                "$BUNDLER --force --symlink --absolute --verbose -T $TMPDIR $JOSHUA_CONFIG $testmodeldir --copy-config-options '-top-n $NBEST -pop-limit 5000 -output-format \"%i ||| %s ||| %f ||| %c\" -mark-oovs false' ${tm_switch}",
+                $JOSHUA_CONFIG,
+                get_file_from_grammar($TEST_GRAMMAR) || $JOSHUA_CONFIG,
+                "$testmodeldir/joshua.config");
 
-# decode
-$cachepipe->cmd("test-$NAME-decode-run",
-								"$testrun/decoder_command",
-                $TEST{source},
-								$TEST_GRAMMAR,
-								$GLUE_GRAMMAR_FILE,
-								"$testrun/test.output.nbest");
+if (defined $TEST_GRAMMAR) {
+  # Update the test grammar (if defined) to its new path
+  my $basename = basename($TEST_GRAMMAR);
+  if (-e "$testmodeldir/$basename") {
+    $TEST_GRAMMAR = "$testmodeldir/$basename";
+  } elsif (-e "$testmodeldir/$basename.packed") {
+    $TEST_GRAMMAR = "$testmodeldir/$basename.packed";
+  } else {
+    print STDERR "* FATAL: test model bundling didn't produce a grammar?";
+    exit 1;
+  }
+}
 
-$cachepipe->cmd("test-$NAME-remove-oov",
-								"cat $testrun/test.output.nbest | perl -pe 's/_OOV//g' > $testrun/test.output.nbest.noOOV",
-								"$testrun/test.output.nbest",
-								"$testrun/test.output.nbest.noOOV");
+my $bestoutput = "$testdir/output";
+my $nbestoutput = "$testdir/output.nbest";
+my $output;
+
+# If we're decoding a lattice, also output the source side path we chose
+$JOSHUA_ARGS = "";
+if ($DOING_LATTICES) {
+  $JOSHUA_ARGS .= " -maxlen 0 -lattice-decoding -output-format \"%i ||| %s ||| %e ||| %f ||| %c\"";
+}
 
 if ($DO_MBR) {
-  $cachepipe->cmd("test-$NAME-onebest-parmbr", 
-									"cat $testrun/test.output.nbest.noOOV | java -Xmx1700m -cp $JOSHUA/class -Dfile.encoding=utf8 joshua.decoder.NbestMinRiskReranker false 1 > $testrun/test.output.1best",
-									"$testrun/test.output.nbest.noOOV", 
-									"$testrun/test.output.1best");
+  $JOSHUA_ARGS .= " -top-n $NBEST -output-format \"%i ||| %s ||| %f ||| %c\"";
+  $output = $nbestoutput;
 } else {
-  $cachepipe->cmd("test-$NAME-extract-onebest",
-									"java -Xmx500m -cp $JOSHUA/class -Dfile.encoding=utf8 joshua.util.ExtractTopCand $testrun/test.output.nbest.noOOV $testrun/test.output.1best",
-									"$testrun/test.output.nbest.noOOV", 
-									"$testrun/test.output.1best");
+  $JOSHUA_ARGS .= " -top-n 0 -output-format %s";
+  $output = $bestoutput;
+}
+$JOSHUA_ARGS .= " $_JOSHUA_ARGS" if defined $_JOSHUA_ARGS;
+
+# Write the decoder run command
+open DEC_CMD, ">$testdir/decoder_command";
+print DEC_CMD "cat $TEST{source} | $testmodeldir/run-joshua.sh -m $JOSHUA_MEM -threads $NUM_THREADS $JOSHUA_ARGS > $output 2> $testdir/joshua.log\n";
+close(DEC_CMD);
+chmod(0755,"$testdir/decoder_command");
+
+# Decode. $output here is either $nbestoutput (if doing MBR decoding, in which case we'll
+# need the n-best output) or $bestoutput (which only outputs the hypothesis but is tons faster)
+$cachepipe->cmd("test-decode-${OPTIMIZER_RUN}",
+                "$testdir/decoder_command",
+                $TEST{source},
+                "$testdir/decoder_command",
+                "$testmodeldir/joshua.config",
+                get_file_from_grammar($TEST_GRAMMAR) || "$testmodeldir/joshua.config",
+                $output);
+
+# $cachepipe->cmd("remove-oov",
+#                 "cat $testoutput | perl -pe 's/_OOV//g' > $testoutput.noOOV",
+#                 $testoutput,
+#                 "$testoutput.noOOV");
+
+# Extract the 1-best output from the n-best file if the n-best file alone was output
+if ($DO_MBR) {
+  $cachepipe->cmd("test-extract-onebest-${OPTIMIZER_RUN}",
+                  "java -Xmx500m -cp $JOSHUA/class -Dfile.encoding=utf8 joshua.util.ExtractTopCand $nbestoutput $bestoutput",
+                  $nbestoutput,
+                  $bestoutput);
+}  
+
+# Now compute the BLEU score on the 1-best output
+$cachepipe->cmd("test-bleu-${OPTIMIZER_RUN}",
+                "$JOSHUA/bin/bleu $output $TEST{target} > $testdir/bleu",
+                $bestoutput,
+                "$testdir/bleu");
+
+# Update the BLEU summary.
+compute_bleu_summary("test/*/bleu", "test/final-bleu");
+
+if (defined $METEOR) {
+  $cachepipe->cmd("test-meteor-${OPTIMIZER_RUN}",
+                  "$JOSHUA/bin/meteor $output $TEST{target} $TARGET > $testdir/meteor",
+                  $bestoutput,
+                  "$testdir/meteor");
+  compute_meteor_summary("test/*/meteor", "test/final-meteor");
 }
 
-$numrefs = get_numrefs($TEST{target});
-$cachepipe->cmd("$NAME-test-bleu",
-								"java -cp $JOSHUA/class -Dfile.encoding=utf8 -Djava.library.path=lib -Xmx1000m -Xms1000m -Djava.util.logging.config.file=logging.properties joshua.util.JoshuaEval -cand $testrun/test.output.1best -ref $TEST{target} -rps $numrefs -m BLEU 4 closest > $testrun/test.output.1best.bleu",
-								"$testrun/test.output.1best", 
-								"$testrun/test.output.1best.bleu");
+if ($DO_MBR) {
+  my $numlines = `cat $TEST{source} | wc -l`;
+  $numlines--;
+  my $mbr_output = "$testdir/output.mbr";
 
-system("cat $testrun/test.output.1best.bleu");
+  $cachepipe->cmd("test-onebest-parmbr-${OPTIMIZER_RUN}", 
+                  "cat $nbestoutput | java -Xmx1700m -cp $JOSHUA/class -Dfile.encoding=utf8 joshua.decoder.NbestMinRiskReranker false 1 $NUM_THREADS > $mbr_output",
+                  $nbestoutput,
+                  $mbr_output);
+
+  $cachepipe->cmd("test-bleu-mbr-${OPTIMIZER_RUN}",
+                  "$JOSHUA/bin/bleu output $TEST{target} $numrefs > $testdir/bleu.mbr",
+                  $mbr_output,
+                  "$testdir/bleu.mbr");
+
+  compute_bleu_summary("test/*/bleu.mbr", "test/final-bleu-mbr");
+}
+
+compute_time_summary("test/*/joshua.log", "test/final-times");
+
+# Now do the analysis
+if ($DOING_LATTICES) {
+  # extract the source
+  my $source = "$testdir/test.lattice-path.txt";
+  $cachepipe->cmd("test-lattice-extract-source-${OPTIMIZER_RUN}",
+                  "$JOSHUA/bin/extract-1best $nbestoutput 2 | perl -pe 's/<s> //' > $source",
+                  $nbestoutput, $source);
+
+  analyze_testrun($bestoutput,$source,$TEST{target});
+} else {
+  analyze_testrun($bestoutput,$TEST{source},$TEST{target});
+}
 
 
 ######################################################################
@@ -1916,108 +1798,125 @@ sub prepare_data {
 
   # copy the data from its original location to our location
 	my $numlines = -1;
-  foreach my $ext ($TARGET,$SOURCE,"$TARGET.0","$TARGET.1","$TARGET.2","$TARGET.3") {
-    # append each extension to the corpora prefixes
-    my @files = map { "$_.$ext" } @$corpora;
-
-		# This block makes sure that the files have a nonzero file size
-		map {
-			if (-z $_) {
-				print STDERR "* FATAL: $label file '$_' is empty";
-				exit 1;
-			}
-		} @files;
-
-    # a list of all the files (in case of multiple corpora prefixes)
-    my $files = join(" ",@files);
-    if (-e $files[0]) {
-      $cachepipe->cmd("$label-copy-$ext",
-                      "cat $files | gzip -9n > $DATA_DIRS{$label}/$label.$ext.gz",
-                      @files, "$DATA_DIRS{$label}/$label.$ext.gz");
-
-			chomp(my $lines = `$CAT $DATA_DIRS{$label}/$label.$ext.gz | wc -l`);
-			$numlines = $lines if ($numlines == -1);
-			if ($lines != $numlines) {
-				print STDERR "* FATAL: $DATA_DIRS{$label}/$label.$ext.gz has a different number of lines ($lines) than a 'parallel' file that preceded it ($numlines)\n";
-				exit(1);
-			}
-		}
+  
+  # Build the list of extensions. For training data, there may be multiple corpora; for
+  # tuning and test data, there may be multiple references.
+  my @exts = ($SOURCE);
+  my $target_corpus = "$corpora->[0].$TARGET";
+  push(@exts, $TARGET) if -e $target_corpus;
+  for (my $i = 0; ; $i++) {
+    my $file = "$target_corpus.$i";
+    if (-e $file) {
+      push(@exts, "$TARGET.$i");
+    } else {
+      last;
+    }
   }
 
-  my $prefix = "$label";
-
-  # tokenize the data
-  foreach my $lang ($TARGET,$SOURCE,"$TARGET.0","$TARGET.1","$TARGET.2","$TARGET.3") {
-		if (-e "$DATA_DIRS{$label}/$prefix.$lang.gz") {
-			if (is_lattice("$DATA_DIRS{$label}/$prefix.$lang.gz")) { 
-				system("cp $DATA_DIRS{$label}/$prefix.$lang.gz $DATA_DIRS{$label}/$prefix.tok.$lang.gz");
-			} else {
-        my $TOKENIZER = ($lang eq $SOURCE) ? $TOKENIZER_SOURCE : $TOKENIZER_TARGET;
-	my $ext = $lang; $ext =~ s/\.\d//;
-				$cachepipe->cmd("$label-tokenize-$lang",
-												"$CAT $DATA_DIRS{$label}/$prefix.$lang.gz | $NORMALIZER $ext | $TOKENIZER -l $ext 2> /dev/null | gzip -9n > $DATA_DIRS{$label}/$prefix.tok.$lang.gz",
-												"$DATA_DIRS{$label}/$prefix.$lang.gz", "$DATA_DIRS{$label}/$prefix.tok.$lang.gz");
-			}
-
-		}
+  # Read through all input files, concatenate them (if multiple were passed), and filter them
+  # First, assemble the file handles
+  my (@infiles, @indeps, @outfiles);
+  foreach my $ext (@exts) {
+    my @files =  map { "$_.$ext" } @$corpora;
+    push(@indeps, @files);
+    if (@files > 1) {
+      push(@infiles, "<(cat " . join(" ", @files) . ")");
+    } else {
+      push(@infiles, $files[0]);
+    }
+    push (@outfiles, "$DATA_DIRS{$label}/$label.$ext");
   }
-  # extend the prefix
-  $prefix .= ".tok";
-  $prefixes{tokenized} = $prefix;
 
-  if ($maxlen > 0) {
-    my (@infiles, @outfiles);
-    foreach my $ext ($TARGET, $SOURCE, "$TARGET.0", "$TARGET.1", "$TARGET.2", "$TARGET.3") {
-      my $infile = "$DATA_DIRS{$label}/$prefix.$ext.gz";
-      my $outfile = "$DATA_DIRS{$label}/$prefix.$maxlen.$ext.gz";
-      if (-e $infile) {
-        push(@infiles, $infile);
-        push(@outfiles, $outfile);
+  my $infiles =  join(" ", @infiles);
+  my $outfiles = join(" ", @outfiles);
+  # only skip blank lines for training data
+  if ($label eq "train") {
+    $cachepipe->cmd("$label-copy-and-filter",
+                    "$PASTE $infiles | $SCRIPTDIR/training/filter-empty-lines.pl | $SCRIPTDIR/training/split2files.pl $outfiles",
+                    @indeps, @outfiles);
+  } else {
+    $cachepipe->cmd("$label-copy-and-filter",
+                    "$PASTE $infiles | $SCRIPTDIR/training/split2files.pl $outfiles",
+                    @indeps, @outfiles);
+  }
+  # Done concatenating and filtering files
+
+  # record where the concatenated input files were
+  $prefixes{last_step} = $prefixes{input} = "$DATA_DIRS{$label}/$label";
+
+  if ($DO_PREPARE_CORPORA) {
+    my $prefix = $label;
+
+    # tokenize the data
+    foreach my $lang (@exts) {
+      if (-e "$DATA_DIRS{$label}/$prefix.$lang") {
+        if (is_lattice("$DATA_DIRS{$label}/$prefix.$lang")) { 
+          system("cp $DATA_DIRS{$label}/$prefix.$lang $DATA_DIRS{$label}/$prefix.tok.$lang");
+        } else {
+          my $TOKENIZER = ($lang eq $SOURCE) ? $TOKENIZER_SOURCE : $TOKENIZER_TARGET;
+          my $ext = $lang; $ext =~ s/\.\d//;
+          $cachepipe->cmd("$label-tokenize-$lang",
+                          "$CAT $DATA_DIRS{$label}/$prefix.$lang | $NORMALIZER $ext | $TOKENIZER -l $ext 2> /dev/null > $DATA_DIRS{$label}/$prefix.tok.$lang",
+                          "$DATA_DIRS{$label}/$prefix.$lang", "$DATA_DIRS{$label}/$prefix.tok.$lang");
+        }
+
       }
     }
+    # extend the prefix
+    $prefix .= ".tok";
+    $prefixes{tokenized} = $prefix;
 
-    my $infilelist = join(" ", map { "<(gzip -cd $_)" } @infiles);
-    my $outfilelist = join(" ", @outfiles);
+    if ($maxlen > 0) {
+      my (@infiles, @outfiles);
+      foreach my $ext (@exts) {
+        my $infile = "$DATA_DIRS{$label}/$prefix.$ext";
+        my $outfile = "$DATA_DIRS{$label}/$prefix.$maxlen.$ext";
+        if (-e $infile) {
+          push(@infiles, $infile);
+          push(@outfiles, $outfile);
+        }
+      }
 
-		# trim training data
-		$cachepipe->cmd("$label-trim",
-										"paste $infilelist | $SCRIPTDIR/training/trim_parallel_corpus.pl $maxlen | $SCRIPTDIR/training/split2files.pl $outfilelist",
-                    @infiles,
-                    @outfiles);
-		$prefix .= ".$maxlen";
-  }
-  # record this whether we shortened or not
-  $prefixes{shortened} = $prefix;
+      my $infilelist = join(" ", @infiles);
+      my $outfilelist = join(" ", @outfiles);
 
-  # lowercase
-  foreach my $lang ($TARGET,$SOURCE,"$TARGET.0","$TARGET.1","$TARGET.2","$TARGET.3") {
-		if (-e "$DATA_DIRS{$label}/$prefix.$lang.gz") {
-			if (is_lattice("$DATA_DIRS{$label}/$prefix.$lang.gz")) { 
-				system("gzip -cd $DATA_DIRS{$label}/$prefix.$lang.gz > $DATA_DIRS{$label}/$prefix.lc.$lang");
-			} else { 
-				$cachepipe->cmd("$label-lowercase-$lang",
-												"gzip -cd $DATA_DIRS{$label}/$prefix.$lang.gz | $SCRIPTDIR/lowercase.perl > $DATA_DIRS{$label}/$prefix.lc.$lang",
-												"$DATA_DIRS{$label}/$prefix.$lang.gz",
-												"$DATA_DIRS{$label}/$prefix.lc.$lang");
-			}
-		}
-  }
-  $prefix .= ".lc";
-  $prefixes{lowercased} = $prefix;
-
-  foreach my $lang ($TARGET,$SOURCE,"$TARGET.0","$TARGET.1","$TARGET.2","$TARGET.3") {
-		if (-e "$DATA_DIRS{$label}/$prefixes{lowercased}.$lang") {
-      system("ln -sf $prefixes{lowercased}.$lang $DATA_DIRS{$label}/corpus.$lang");
+      # trim training data
+      $cachepipe->cmd("$label-trim",
+                      "$PASTE $infilelist | $SCRIPTDIR/training/trim_parallel_corpus.pl $maxlen | $SCRIPTDIR/training/split2files.pl $outfilelist",
+                      @infiles,
+                      @outfiles);
+      $prefix .= ".$maxlen";
     }
+    # record this whether we shortened or not
+    $prefixes{shortened} = $prefix;
+
+    # lowercase
+    foreach my $lang (@exts) {
+      if (-e "$DATA_DIRS{$label}/$prefix.$lang") {
+        if (is_lattice("$DATA_DIRS{$label}/$prefix.$lang")) { 
+          system("cat $DATA_DIRS{$label}/$prefix.$lang > $DATA_DIRS{$label}/$prefix.lc.$lang");
+        } else { 
+          $cachepipe->cmd("$label-lowercase-$lang",
+                          "cat $DATA_DIRS{$label}/$prefix.$lang | $LOWERCASER > $DATA_DIRS{$label}/$prefix.lc.$lang",
+                          "$DATA_DIRS{$label}/$prefix.$lang",
+                          "$DATA_DIRS{$label}/$prefix.lc.$lang");
+        }
+      }
+    }
+    $prefix .= ".lc";
+    $prefixes{last_step} = $prefixes{lowercased} = $prefix;
   }
 
-  if ($label eq "train") {
-    foreach my $lang ($TARGET, $SOURCE) {
-      $cachepipe->cmd("$label-vocab-$lang",
-                      "cat $DATA_DIRS{$label}/corpus.$lang | $SCRIPTDIR/training/build-vocab.pl > $DATA_DIRS{$label}/vocab.$lang",
-                      "$DATA_DIRS{$label}/corpus.$lang",
-                      "$DATA_DIRS{$label}/vocab.$lang");
-    }
+  foreach my $lang (@exts) {
+    system("ln -sf $prefixes{last_step}.$lang $DATA_DIRS{$label}/corpus.$lang");
+  }
+
+  # Build a vocabulary
+  foreach my $ext (@exts) {
+    $cachepipe->cmd("$label-vocab-$ext",
+                    "cat $DATA_DIRS{$label}/corpus.$ext | $SCRIPTDIR/training/build-vocab.pl > $DATA_DIRS{$label}/vocab.$ext",
+                    "$DATA_DIRS{$label}/corpus.$ext",
+                    "$DATA_DIRS{$label}/vocab.$ext");
   }
 
   return \%prefixes;
@@ -2084,8 +1983,9 @@ sub rollout_hadoop_cluster {
   # if it's not already unpacked, unpack it
   if (! -d "hadoop") {
 
-		system("tar xzf $JOSHUA/lib/hadoop-0.20.2.tar.gz");
-		system("ln -sf hadoop-0.20.2 hadoop");
+    my $hadoop_tmp_dir = tempdir("hadoop-XXXX", DIR => $TMPDIR, CLEANUP => 0);
+		system("tar xzf $JOSHUA/lib/hadoop-2.5.2.tar.gz -C $hadoop_tmp_dir");
+		system("ln -sf $hadoop_tmp_dir/hadoop-2.5.2 hadoop");
     if (defined $HADOOP_CONF) {
       print STDERR "Copying HADOOP_CONF($HADOOP_CONF) to hadoop/conf/core-site.xml\n";
       system("cp $HADOOP_CONF hadoop/conf/core-site.xml");
@@ -2102,10 +2002,10 @@ sub stop_hadoop_cluster {
   }
 }
 
-sub teardown_hadoop_cluster {
-  stop_hadoop_cluster();
-  system("rm -rf hadoop-0.20.2 hadoop");
-}
+#sub teardown_hadoop_cluster {
+#  stop_hadoop_cluster();
+#  system("rm -f hadoop");
+#}
 
 sub is_lattice {
   my $file = shift;
@@ -2119,6 +2019,12 @@ sub is_lattice {
   } else {
 		return 0;
   }
+}
+
+# Set membership: is value in array?
+sub in {
+  my ($value, $array) = @_;
+  return grep( /^$value$/, @$array );
 }
 
 # This function retrieves the names of all the features in the grammar. Dense features
@@ -2195,12 +2101,30 @@ sub analyze_testrun {
 
   my $references = join(" -r ", @references);
 
-  my $runname = "analyze-$dir";
-  $runname =~ s/\//-/g;
-  $cachepipe->cmd($runname,
+  $cachepipe->cmd("analyze-test-${OPTIMIZER_RUN}",
                   "$SCRIPTDIR/analysis/sentence-by-sentence.pl -s $source -r $references $output > $dir/analysis/sentence-by-sentence.html",
-                  "$dir/test.output.1best",
+                  $output,
                   "$dir/analysis/sentence-by-sentence.html");
+}
+
+sub compute_meteor_summary {
+  my ($filepattern, $outputfile) = @_;
+
+  # Average the runs, report result
+  my @scores;
+  my $numrecs = 0;
+  open CMD, "grep '^Final score' $filepattern |";
+  my @F = split(' ', <CMD>);
+  close(CMD);
+  push(@scores, 1.0 * $F[-1]);
+
+  if (scalar @scores) {
+    my $final_score = sum(@scores) / (scalar @scores);
+
+    open SUMMARY, ">$outputfile" or die "Can't write to $outputfile";
+    printf(SUMMARY "%s / %d = %.4f\n", join(" + ", @scores), scalar @scores, $final_score);
+    close(SUMMARY);
+  }
 }
 
 sub compute_bleu_summary {
